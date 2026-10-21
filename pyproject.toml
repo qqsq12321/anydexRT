@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anydexrt"
+version = "0.1.0"
+description = "Reproduction of AnyDexRT: calibration-free dexterous hand retargeting with few-shot human guidance"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Kept deliberately narrow: the method needs kinematics and small MLPs, nothing
+# from the JAX/hydra stack that mimic_retargeter_lab carries.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.0",
+    "mujoco>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["anydexrt*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The ROS humble overlay on this machine injects its own site-packages into
+# PYTHONPATH and breaks pytest's plugin loading; run without it:
+#   env PYTHONPATH=/home/qsq/qqsq12321/anydexRT python -m pytest tests/ -q
+addopts = "-p no:cacheprovider"
