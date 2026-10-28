@@ -57,7 +57,7 @@ unrelated to the method.
 conda activate anydex          # mujoco + torch + numpy + scipy
 export PYTHONPATH=/home/qsq/qqsq12321/anydexRT
 
-pytest tests/ -q                                   # 117 unit tests
+pytest tests/ -q                                   # 137 unit tests
 python scripts/validate_chamfer_collapse.py        # rung 1 alone
 python scripts/run_ladder.py --epochs 60           # the full ladder
 ```
@@ -469,6 +469,54 @@ every finger comes out rotated and the thumb will not open. Train through
 this reason, rather than assembling the setup by hand — this was hit twice while
 adding PICO support, silently both times, with healthy-looking loss curves.
 
+### Real hardware (Linker L20)
+
+`anydexrt/real_l20.py` drives the physical hand over RS485/Modbus. Two opt-ins
+are required, so a copy-pasted command cannot move hardware:
+
+```bash
+python scripts/teleop_avp.py --hand linker_l20 --input pico4 --real
+#   -> dry run: the 30 position registers are computed and printed,
+#      the serial port is never opened
+python scripts/teleop_avp.py --hand linker_l20 --input pico4 --real --confirm-real
+#   -> opens /dev/ttyUSB0 and moves the hand
+```
+
+Run dry first and watch the registers track the hand sensibly. Useful flags:
+`--l20-port`, `--l20-slave-id` (0x29 right, 0x2A left), `--l20-speed`,
+`--l20-current-limit`, `--l20-open-on-exit` (leave the hand open instead of
+holding its last pose), `--l20-clear-faults` (if it came up latched after a
+stall). Needs `pyserial`.
+
+Joint **limits** need no conversion — anydexRT's L20 limits equal the driver's
+per-joint, which `tests/test_real_l20.py` asserts — but the qpos→register
+mapping is **not** the identity. Three measured corrections sit in between, all
+calibrated against the physical hand by GEORT rather than derived from the URDF:
+
+- **Offsets.** The four finger MCP pitches are shifted −0.152 rad (−8.7°) and
+  the thumb CMC roll +0.15 rad: simulation zero is not the hand's zero.
+- **A piecewise curve** for three thumb joints, measured at three points each.
+  It differs from linear limit normalization by up to 0.10 of full scale (~26
+  counts) — e.g. thumb CMC roll at qpos 0, thumb MCP at 0.3 — so it is used
+  where it exists and linear normalization only elsewhere.
+- **Direction inversion** for the thumb and every pitch/PIP joint. Finger MCP
+  roll is deliberately *not* inverted, matching the register protocol.
+
+Each command is 30 registers: `roll(5) + yaw(5) + root1(5) + distal(5)×3`. The
+distal block repeats because PIP, DIP and the fingertip segment share one
+value, and only the thumb has a real roll register (the other four carry the
+neutral 128). Identical consecutive commands are skipped — the retargeter runs
+at ~1300 Hz while the registers are 8-bit, so most frames produce the same
+bytes.
+
+This is an independent reimplementation of the protocol and the calibration, so
+nothing is imported from another repository (the same approach as
+`anydexrt/pico.py`). It was checked register-for-register against the original
+driver over 804 poses — 300 frames of real replay, 500 random in-range, and the
+limit corners — with zero differences, plus matching CRC-16. **It has not been
+run against the physical hand from this repository**; the equivalence check and
+`tests/test_real_l20.py` (20 tests, fake serial port) are what stands behind it.
+
 ## Errata (found while porting to Wuji / L20 / AVP)
 
 Four defects in the first version, all silent — every loss curve looked healthy.
@@ -555,6 +603,7 @@ anydexrt/
   inference.py    end-to-end retargeting, pinch + fist refinement, bundles
   avp.py          Apple Vision Pro skeleton handling
   pico.py         PICO 4 wire protocol client (relay + direct), independent impl
+  real_l20.py     Linker L20 RS485/Modbus output, independent impl
 scripts/
   train_bundle.py                train one deployable bundle from a recording
   run_avp.py                     the AVP ablation ladder + evaluation
@@ -567,8 +616,8 @@ scripts/
   run_ladder.py                  the full ladder
 calibrated_pinch_poses.yaml      output of calibrate_pinch.py (L20)
 calibrated_fist_pose.yaml        output of calibrate_fist.py (L20)
-tests/           117 unit tests (losses, metrics, normalization, frames,
-                 smoothing, AVP, PICO protocol round-trips)
+tests/           137 unit tests (losses, metrics, normalization, frames,
+                 smoothing, AVP, PICO protocol round-trips, L20 registers)
 ```
 
 ## Licence note

@@ -66,21 +66,29 @@ Pinch assist is OFF by default (`--pinch-mode off`). Three modes:
                               barely tracks the real one).
     --pinch-mode off          (default) raw f_m output, no pinch assist.
 
-Real hardware (Linker L20 only, via AnyDexRetarget's RS485 driver):
+Real hardware (Linker L20 only), via anydexrt.real_l20:
 
-    python scripts/teleop_avp.py --hand linker_l20 --real --confirm-real
+    python scripts/teleop_avp.py --hand linker_l20 --real                  # dry run
+    python scripts/teleop_avp.py --hand linker_l20 --real --confirm-real   # moves the hand
 
 `--real` alone is NOT enough to move the physical hand -- it also requires
 `--confirm-real` as a second, explicit opt-in, so a copy-pasted command line
 cannot accidentally drive real hardware. Without `--confirm-real`, `--real`
-runs in dry-run mode: registers are computed and printed, nothing is sent
-over the wire. The joint convention was checked to match exactly
-(anydexRT's L20 joint limits equal the driver's GEORT-calibrated limits,
-checked per-joint before this flag was added) so qpos is sent as-is, no
-unit conversion layer. Default serial settings (port /dev/ttyUSB0, baud
-460800, slave id 0x29, speed 200, current_limit 200) are the driver's own
-conservative defaults for first bring-up; override with --l20-port etc. if
-your setup differs.
+runs dry: the 30 position registers are computed and printed, the serial port
+is never opened. Run dry first and watch the registers move sensibly.
+
+Joint LIMITS need no conversion -- anydexRT's L20 limits equal the driver's
+per-joint (checked before this flag existed) -- but the qpos->register mapping
+is not the identity: it applies GEORT's measured offsets (the four finger MCP
+pitches are shifted -8.7 deg, i.e. simulation zero is not the hand's zero),
+a measured piecewise curve for three thumb joints, and per-joint direction
+inversion. See anydexrt/real_l20.py.
+
+Default serial settings (port /dev/ttyUSB0, baud 460800, slave id 0x29 for the
+right hand, speed 200, current_limit 200) are conservative values for first
+bring-up; override with --l20-port, --l20-slave-id etc. Add --l20-open-on-exit
+to leave the hand open rather than holding its last pose, and
+--l20-clear-faults if it came up latched after a stall.
 """
 
 from __future__ import annotations
@@ -98,12 +106,13 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-ANYDEXRETARGET_ROOT = Path("/home/qsq/qqsq12321/AnyDexRetarget")
-sys.path.insert(0, str(ANYDEXRETARGET_ROOT))
 
 from anydexrt.data import VP_TO_MEDIAPIPE  # noqa: E402
 from anydexrt.inference import load_bundle  # noqa: E402
 
+# A recording to fall back on for --replay. Data only -- no code from that
+# repository is imported any more (the L20 driver was the last one; it now
+# lives in anydexrt/real_l20.py). Override with --replay <file>.
 DEFAULT_REPLAY = "/home/qsq/qqsq12321/AnyDexRetarget/example/data/avp1.pkl"
 
 # How far a fingertip must reach from the palm origin before the pinch blend
@@ -297,6 +306,12 @@ def main() -> int:
                     help="0x29 right hand, 0x2A left (accepts 0x.. or decimal)")
     ap.add_argument("--l20-speed", type=int, default=200, help="conservative default for first bring-up")
     ap.add_argument("--l20-current-limit", type=int, default=200)
+    ap.add_argument("--l20-clear-faults", action="store_true",
+                    help="pulse the clear-fault registers during startup; use if the hand "
+                         "came up latched after a stall or an e-stop")
+    ap.add_argument("--l20-open-on-exit", action="store_true",
+                    help="command an open palm before closing the serial port, so the hand "
+                         "is not left holding a clenched pose")
     args = ap.parse_args()
 
     if args.real and args.hand != "linker_l20":
@@ -343,7 +358,7 @@ def main() -> int:
 
     real_driver = None
     if args.real:
-        from example.output.real.drivers_linker_l20 import LinkerL20Output
+        from anydexrt.real_l20 import LinkerL20Output
 
         dry_run = not args.confirm_real
         if dry_run:
@@ -356,6 +371,7 @@ def main() -> int:
         real_driver = LinkerL20Output(
             port=args.l20_port, baudrate=args.l20_baudrate, slave_id=args.l20_slave_id,
             speed=args.l20_speed, current_limit=args.l20_current_limit,
+            clear_faults=args.l20_clear_faults, open_on_exit=args.l20_open_on_exit,
             print_registers=dry_run, dry_run=dry_run,
         )
 
