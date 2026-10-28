@@ -80,7 +80,8 @@ is never opened. Run dry first and watch the registers move sensibly.
 Joint LIMITS need no conversion -- anydexRT's L20 limits equal the driver's
 per-joint (checked before this flag existed) -- but the qpos->register mapping
 is not the identity: it applies GEORT's measured offsets (the four finger MCP
-pitches are shifted -8.7 deg, i.e. simulation zero is not the hand's zero),
+pitches are shifted -8.7 deg, i.e. simulation zero is not the hand's zero;
+the thumb CMC roll offset is off by default, see --l20-thumb-roll-offset),
 a measured piecewise curve for three thumb joints, and per-joint direction
 inversion. See anydexrt/real_l20.py.
 
@@ -311,10 +312,11 @@ def main() -> int:
                          "came up latched after a stall or an e-stop")
     ap.add_argument("--l20-thumb-roll-offset", type=float, default=None,
                     help="qpos offset (rad) added to thumb_cmc_roll before its calibration "
-                         "curve, which sets how far out the thumb sits at rest. Default 0.10 "
-                         "(anydexrt.real_l20); the original driver used 0.15, which pins qpos=0 "
-                         "to the hard stop. Lower it to move the thumb outward: at qpos 0.2 the "
-                         "register goes 210 -> 242 across 0.15 -> 0.0. Judge it on the hand.")
+                         "curve, which sets how far out the thumb sits at rest. Default 0 (off); "
+                         "the original driver used 0.15, which pins qpos=0 to the hard stop. "
+                         "Off keeps the thumb further out (register 220 -> 242 at qpos 0.2) but "
+                         "costs the end of travel (qpos 1.39 -> register 9, not 0), so raise it "
+                         "to ~0.05 if the thumb cannot close far enough to pinch.")
     ap.add_argument("--l20-open-on-exit", action="store_true",
                     help="command an open palm before closing the serial port, so the hand "
                          "is not left holding a clenched pose")

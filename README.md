@@ -493,13 +493,14 @@ per-joint, which `tests/test_real_l20.py` asserts — but the qpos→register
 mapping is **not** the identity. Three measured corrections sit in between, all
 calibrated against the physical hand by GEORT rather than derived from the URDF:
 
-- **Offsets.** The four finger MCP pitches are shifted −0.152 rad (−8.7°) and
-  the thumb CMC roll +0.10 rad: simulation zero is not the hand's zero. The
-  thumb roll value is `--l20-thumb-roll-offset`, lowered here from the original
-  driver's 0.15 — that pinned qpos=0 to the alignment curve's left point, i.e.
-  the hard stop. It decides how far out the thumb sits at rest (at qpos 0.2 the
-  register goes 210 → 242 across 0.15 → 0.0) and can only be judged on a
-  physical hand.
+- **Offsets.** The four finger MCP pitches are shifted −0.152 rad (−8.7°):
+  simulation zero is not the hand's zero. The thumb CMC roll offset
+  (`--l20-thumb-roll-offset`) is **off by default**, where the original driver
+  had 0.15 — that pinned qpos=0 to the alignment curve's left point, i.e. the
+  hard stop. Off keeps the thumb further out through the usable range (register
+  220 → 242 at qpos 0.2) but costs the end of travel: qpos 1.39 maps to
+  register 9 rather than 0, so if the thumb cannot close far enough to complete
+  a pinch, raise it to ~0.05. Only a physical hand settles this.
 - **A piecewise curve** for three thumb joints, measured at three points each.
   It differs from linear limit normalization by up to 0.10 of full scale (~26
   counts) — e.g. thumb CMC roll at qpos 0, thumb MCP at 0.3 — so it is used
@@ -520,7 +521,7 @@ nothing is imported from another repository (the same approach as
 driver over 804 poses — 300 frames of real replay, 500 random in-range, and the
 limit corners — with zero differences, plus matching CRC-16. With
 `--l20-thumb-roll-offset 0.15` that equivalence still holds exactly, so the
-lowered default is the only intentional divergence. **It has not been
+thumb roll offset is the only intentional divergence. **It has not been
 run against the physical hand from this repository**; the equivalence check and
 `tests/test_real_l20.py` (20 tests, fake serial port) are what stands behind it.
 

@@ -329,13 +329,28 @@ def test_thumb_roll_offset_is_tunable(names, limits):
         assert regs[off][1:] == regs[0.15][1:], "offset touched another joint"
 
 
-def test_default_offset_is_lowered_from_the_original_driver():
-    """0.15 pinned qpos=0 to the curve's left point, i.e. the hard stop."""
+def test_thumb_roll_offset_defaults_off(names, limits):
+    """Off by default; 0.15 (the original driver) pinned qpos=0 to the stop.
+
+    Also pins the trade-off that comes with switching it off, so it cannot
+    regress silently: the thumb sits further out through the usable range but
+    no longer reaches the end of travel.
+    """
     from anydexrt.real_l20 import _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD as default
 
-    assert default == pytest.approx(0.10)
+    assert default == 0.0
     sim, cmd = zip(*_QPOS_ALIGNMENT_POINTS["THUMB_CMC_ROLL"])
-    assert float(np.interp(0.0 + 0.15, sim, cmd)) < 0.02      # old: at the stop
-    assert float(np.interp(0.0 + default, sim, cmd)) == 0.0    # new: clamped below it
-    # ...and the usable range is where it differs
-    assert float(np.interp(0.2 + default, sim, cmd)) < float(np.interp(0.2 + 0.15, sim, cmd))
+    assert float(np.interp(0.0 + 0.15, sim, cmd)) < 0.02   # old: already at the stop
+    assert float(np.interp(0.0 + default, sim, cmd)) == 0.0
+
+    lo, hi = limits
+    i = names.index("thumb_cmc_roll")
+    out = LinkerL20Output(dry_run=True)
+    q = (lo + hi) / 2
+
+    q[i] = hi[i]
+    assert out.qpos_to_registers(q, names)[0] > 0, "end of travel unexpectedly reachable"
+
+    q[i] = 0.2
+    with_offset = LinkerL20Output(dry_run=True, thumb_cmc_roll_offset=0.15)
+    assert out.qpos_to_registers(q, names)[0] > with_offset.qpos_to_registers(q, names)[0]
