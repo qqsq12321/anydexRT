@@ -11,8 +11,11 @@ joint value and the byte the hand receives, all of them measured against the
 physical hand by GEORT rather than derived from the URDF:
 
   1. **Offsets** (`_JOINT_OFFSETS_RAD`). The four finger MCP pitches get
-     -0.152 rad (-8.7 deg) and the thumb CMC roll +0.15 rad, i.e. simulation
-     zero is not the real hand's zero.
+     -0.152 rad (-8.7 deg) and the thumb CMC roll a positive offset, i.e.
+     simulation zero is not the real hand's zero. The thumb roll offset is
+     tunable (`thumb_cmc_roll_offset`, default 0.10 rad, lowered from the
+     original driver's 0.15) because it decides how far out the thumb sits at
+     rest and can only be judged on a physical hand.
   2. **Piecewise alignment** for the three thumb joints that were measured at
      three points each (`_QPOS_ALIGNMENT_POINTS`). Interpolating through them
      differs from linear limit normalization by up to 0.10 of full scale
@@ -110,9 +113,21 @@ _INVERTED_JOINTS = frozenset({
     "PINKY_PIP",
 })
 
-# Applied to qpos before normalization: simulation zero is not the hand's zero.
+# Applied to qpos before normalization (and before the alignment curve, for the
+# joints that have one): simulation zero is not the hand's zero.
+#
+# THUMB_CMC_ROLL's value is the one most worth re-checking against a physical
+# hand: it is the only positive offset here, it feeds the steepest part of its
+# alignment curve, and the curve's left point (0.1396) sits almost exactly at
+# 0 + 0.15, so the default pins qpos=0 to a commanded 0.009 -- essentially the
+# hard stop. Lowering it moves the thumb outward at rest (register 210 -> 242
+# at qpos 0.2 going 0.15 -> 0.0). Override per run with
+# LinkerL20Output(thumb_cmc_roll_offset=...), i.e.
+# `teleop_avp.py --l20-thumb-roll-offset`.
+_DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.10
+
 _JOINT_OFFSETS_RAD = {
-    "THUMB_CMC_ROLL": 0.15,
+    "THUMB_CMC_ROLL": _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
     "INDEX_MCP_PITCH": -0.15235988,
     "MIDDLE_MCP_PITCH": -0.15235988,
     "RING_MCP_PITCH": -0.15235988,
@@ -259,8 +274,11 @@ class LinkerL20Output:
         open_on_exit: bool = False,
         print_registers: bool = False,
         dry_run: bool = False,
+        thumb_cmc_roll_offset: float = _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
     ):
         self.dry_run = bool(dry_run)
+        self._offsets = dict(_JOINT_OFFSETS_RAD)
+        self._offsets["THUMB_CMC_ROLL"] = float(thumb_cmc_roll_offset)
         self.print_registers = bool(print_registers)
         self._open_on_exit = bool(open_on_exit)
         self._last_registers: list[int] | None = None
@@ -305,7 +323,7 @@ class LinkerL20Output:
 
     def _normalized(self, qpos: np.ndarray, suffix: str) -> float:
         """One joint's qpos -> [0, 1] command, before direction inversion."""
-        value = float(qpos[self._index_by_suffix[suffix]]) + _JOINT_OFFSETS_RAD.get(suffix, 0.0)
+        value = float(qpos[self._index_by_suffix[suffix]]) + self._offsets.get(suffix, 0.0)
         alignment = _QPOS_ALIGNMENT_POINTS.get(suffix)
         if alignment is not None:
             sim_qpos, commanded = zip(*alignment)
@@ -370,4 +388,5 @@ class LinkerL20Output:
 
 
 __all__ = ["LinkerL20Output", "LinkerL20RS485", "PORT", "BAUDRATE",
-           "RIGHT_SLAVE_ID", "LEFT_SLAVE_ID", "SPEED", "CURRENT_LIMIT"]
+           "RIGHT_SLAVE_ID", "LEFT_SLAVE_ID", "SPEED", "CURRENT_LIMIT",
+           "_DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD"]

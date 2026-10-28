@@ -57,7 +57,7 @@ unrelated to the method.
 conda activate anydex          # mujoco + torch + numpy + scipy
 export PYTHONPATH=/home/qsq/qqsq12321/anydexRT
 
-pytest tests/ -q                                   # 137 unit tests
+pytest tests/ -q                                   # 139 unit tests
 python scripts/validate_chamfer_collapse.py        # rung 1 alone
 python scripts/run_ladder.py --epochs 60           # the full ladder
 ```
@@ -494,7 +494,12 @@ mapping is **not** the identity. Three measured corrections sit in between, all
 calibrated against the physical hand by GEORT rather than derived from the URDF:
 
 - **Offsets.** The four finger MCP pitches are shifted −0.152 rad (−8.7°) and
-  the thumb CMC roll +0.15 rad: simulation zero is not the hand's zero.
+  the thumb CMC roll +0.10 rad: simulation zero is not the hand's zero. The
+  thumb roll value is `--l20-thumb-roll-offset`, lowered here from the original
+  driver's 0.15 — that pinned qpos=0 to the alignment curve's left point, i.e.
+  the hard stop. It decides how far out the thumb sits at rest (at qpos 0.2 the
+  register goes 210 → 242 across 0.15 → 0.0) and can only be judged on a
+  physical hand.
 - **A piecewise curve** for three thumb joints, measured at three points each.
   It differs from linear limit normalization by up to 0.10 of full scale (~26
   counts) — e.g. thumb CMC roll at qpos 0, thumb MCP at 0.3 — so it is used
@@ -513,7 +518,9 @@ This is an independent reimplementation of the protocol and the calibration, so
 nothing is imported from another repository (the same approach as
 `anydexrt/pico.py`). It was checked register-for-register against the original
 driver over 804 poses — 300 frames of real replay, 500 random in-range, and the
-limit corners — with zero differences, plus matching CRC-16. **It has not been
+limit corners — with zero differences, plus matching CRC-16. With
+`--l20-thumb-roll-offset 0.15` that equivalence still holds exactly, so the
+lowered default is the only intentional divergence. **It has not been
 run against the physical hand from this repository**; the equivalence check and
 `tests/test_real_l20.py` (20 tests, fake serial port) are what stands behind it.
 
@@ -616,7 +623,7 @@ scripts/
   run_ladder.py                  the full ladder
 calibrated_pinch_poses.yaml      output of calibrate_pinch.py (L20)
 calibrated_fist_pose.yaml        output of calibrate_fist.py (L20)
-tests/           137 unit tests (losses, metrics, normalization, frames,
+tests/           139 unit tests (losses, metrics, normalization, frames,
                  smoothing, AVP, PICO protocol round-trips, L20 registers)
 ```
 

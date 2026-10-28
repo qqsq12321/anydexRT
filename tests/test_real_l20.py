@@ -307,3 +307,35 @@ def test_register_values_are_clamped(monkeypatch):
     drv.write_registers(0, [-5, 300, 128])
     payload = bytes(fake.written)[7:13]
     assert payload == bytes([0x00, 0, 0x00, 255, 0x00, 128])
+
+
+def test_thumb_roll_offset_is_tunable(names, limits):
+    """Only thumb_cmc_roll's register moves, and it moves the right way.
+
+    The offset feeds the alignment curve, so this also guards the order:
+    offset first, then interpolation.
+    """
+    lo, hi = limits
+    q = (lo + hi) / 2
+    q[names.index("thumb_cmc_roll")] = 0.2
+
+    regs = {
+        off: LinkerL20Output(dry_run=True, thumb_cmc_roll_offset=off).qpos_to_registers(q, names)
+        for off in (0.0, 0.10, 0.15)
+    }
+    # THUMB_CMC_ROLL is inverted, so a smaller offset -> larger register
+    assert regs[0.0][0] > regs[0.10][0] > regs[0.15][0]
+    for off in (0.0, 0.10):
+        assert regs[off][1:] == regs[0.15][1:], "offset touched another joint"
+
+
+def test_default_offset_is_lowered_from_the_original_driver():
+    """0.15 pinned qpos=0 to the curve's left point, i.e. the hard stop."""
+    from anydexrt.real_l20 import _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD as default
+
+    assert default == pytest.approx(0.10)
+    sim, cmd = zip(*_QPOS_ALIGNMENT_POINTS["THUMB_CMC_ROLL"])
+    assert float(np.interp(0.0 + 0.15, sim, cmd)) < 0.02      # old: at the stop
+    assert float(np.interp(0.0 + default, sim, cmd)) == 0.0    # new: clamped below it
+    # ...and the usable range is where it differs
+    assert float(np.interp(0.2 + default, sim, cmd)) < float(np.interp(0.2 + 0.15, sim, cmd))

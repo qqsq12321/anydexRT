@@ -309,6 +309,12 @@ def main() -> int:
     ap.add_argument("--l20-clear-faults", action="store_true",
                     help="pulse the clear-fault registers during startup; use if the hand "
                          "came up latched after a stall or an e-stop")
+    ap.add_argument("--l20-thumb-roll-offset", type=float, default=None,
+                    help="qpos offset (rad) added to thumb_cmc_roll before its calibration "
+                         "curve, which sets how far out the thumb sits at rest. Default 0.10 "
+                         "(anydexrt.real_l20); the original driver used 0.15, which pins qpos=0 "
+                         "to the hard stop. Lower it to move the thumb outward: at qpos 0.2 the "
+                         "register goes 210 -> 242 across 0.15 -> 0.0. Judge it on the hand.")
     ap.add_argument("--l20-open-on-exit", action="store_true",
                     help="command an open palm before closing the serial port, so the hand "
                          "is not left holding a clenched pose")
@@ -373,6 +379,8 @@ def main() -> int:
             speed=args.l20_speed, current_limit=args.l20_current_limit,
             clear_faults=args.l20_clear_faults, open_on_exit=args.l20_open_on_exit,
             print_registers=dry_run, dry_run=dry_run,
+            **({} if args.l20_thumb_roll_offset is None
+               else {"thumb_cmc_roll_offset": args.l20_thumb_roll_offset}),
         )
 
     model = kin.model
