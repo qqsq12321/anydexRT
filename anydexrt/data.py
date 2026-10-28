@@ -286,9 +286,61 @@ def palm_tips_from_avp_poses(poses: np.ndarray, hand: HandSpec | str) -> np.ndar
     return to_frame(pos[hand.human_ids("manus")], pos[w], rot)
 
 
+def palm_tips_from_mediapipe_points(points21: np.ndarray, hand: HandSpec | str) -> np.ndarray:
+    """Live single-frame (21, 3) MediaPipe-order, wrist-relative points ->
+    (F, 3) fingertips in this frame's palm frame.
+
+    For any source that natively outputs MediaPipe landmarks instead of AVP's
+    25-joint skeleton -- e.g. PICO 4 hand tracking
+    (AnyDexRetarget/example/input/pico4.py), whose JOINT_21_INDICES already
+    produces this exact (21, 3), wrist-origin format. Mirrors
+    `palm_tips_from_avp_poses`'s per-frame approach and `load_avp_pkl`'s
+    per-frame palm construction -- same four palm points, same
+    `HUMAN_PALM_IDS["mediapipe"]` / `human_ids("mediapipe")` indices, just a
+    single live frame instead of a recording. No side-mirroring here, to stay
+    symmetric with `palm_tips_from_avp_poses` (callers mirror left-hand input
+    externally, same convention `teleop_avp.py` already uses for AVP).
+    """
+    from .hands import HUMAN_PALM_IDS
+    from .kinematics import palm_frame_from_points
+
+    hand = get_hand(hand) if isinstance(hand, str) else hand
+    pos = np.asarray(points21, dtype=np.float64)
+    if pos.shape != (21, 3):
+        raise ValueError(f"expected (21, 3) MediaPipe landmarks, got {pos.shape}")
+    w, i, m, k = HUMAN_PALM_IDS["mediapipe"]
+    rot = palm_frame_from_points(pos[w], pos[i], pos[m], pos[k])
+    return to_frame(pos[hand.human_ids("mediapipe")], pos[w], rot)
+
+
+def thumb_straightness(mcp: np.ndarray, ip: np.ndarray, tip: np.ndarray) -> float:
+    """How straight the thumb is, in [0, 1]: 1 = MCP/IP/TIP collinear.
+
+    `|tip - mcp| / (|ip - mcp| + |tip - ip|)`, i.e. end-to-end distance over
+    path length along the bones. A SHAPE ratio, so unlike a distance in mm it
+    does not change with the operator's hand size or the tracker's own bone
+    conventions -- which is the point. Measured on curled-fingers frames, the
+    thumb's distance from the palm origin separates a fist from an extended
+    thumb on AVP (95-106mm vs 119-142mm) but NOT on PICO 4, whose thumb reach
+    is compressed into 90-122mm with no gap in between; PICO's OpenXR thumb
+    root (ThumbMetacarpal) sits further out than AVP's THUMB_CMC, making the
+    thumb measure 25% shorter end to end. This ratio splits both devices at
+    the same place: curled < 0.88, extended > 0.94 on each.
+    """
+    path = np.linalg.norm(ip - mcp) + np.linalg.norm(tip - ip)
+    if path < 1e-9:
+        return 0.0
+    return float(np.linalg.norm(tip - mcp) / path)
+
+
 # Index of each MediaPipe landmark in the AVP 25-joint skeleton
 # (AnyDexRetarget/example/input/visionpro.py: VP_TO_MEDIAPIPE).
 VP_TO_MEDIAPIPE = (0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24)
+
+# MediaPipe landmark indices of the three thumb joints `thumb_straightness`
+# needs (THUMB_MCP, THUMB_IP, THUMB_TIP). The same indices address the AVP
+# 25-joint skeleton directly -- VP_TO_MEDIAPIPE is the identity for 0..4.
+THUMB_MCP_IP_TIP = (2, 3, 4)
 
 
 def load_avp_pkl(

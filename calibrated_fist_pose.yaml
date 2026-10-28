@@ -1,0 +1,45 @@
+qpos:
+- 0.7436
+- 0.1806
+- 0.1535
+- 1.25
+- -0.0
+- 1.22
+- 1.7425
+- 0.0
+- 1.22
+- 1.7425
+- -0.0
+- 1.22
+- 1.7425
+- -0.0
+- 1.22
+- 1.7425
+joint_names:
+- thumb_cmc_roll
+- thumb_cmc_yaw
+- thumb_cmc_pitch
+- thumb_mcp
+- index_mcp_roll
+- index_mcp_pitch
+- index_pip
+- middle_mcp_roll
+- middle_mcp_pitch
+- middle_pip
+- ring_mcp_roll
+- ring_mcp_pitch
+- ring_pip
+- pinky_mcp_roll
+- pinky_mcp_pitch
+- pinky_pip
+thumb_reach_mm: 184.44
+finger_reach_mm:
+- 174.93
+- 176.16
+- 171.74
+- 170.59
+thumb_to_finger_gap_mm:
+- 22.48
+- 30.63
+- 50.3
+- 72.57

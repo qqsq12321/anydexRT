@@ -11,9 +11,9 @@ page), so this is an independent implementation from the paper text, built to be
 [What this does not claim](#what-this-does-not-claim).
 
 ```
-human fingertips --> f_m (FingerMapper) --> robot fingertips --> f_s (NNS) --> joints
-                          ^                        ^
-                     few-shot anchors         contact classifier
+human fingertips --> f_m --> robot fingertips --> f_s (NNS) --> joints --> refine --> filter
+                      ^                              ^                      ^
+                 few-shot anchors            continuity prior        pinch / fist blend
 ```
 
 ## What is implemented
@@ -32,6 +32,21 @@ human fingertips --> f_m (FingerMapper) --> robot fingertips --> f_s (NNS) --> j
 | NNS inverse kinematics + pinch template retrieval | Inference | `anydexrt/inference.py` |
 | GMC / LMC | §4.1 | `anydexrt/metrics.py` |
 
+### Added beyond the paper, for the AVP / PICO 4 → L20 deployment
+
+The paper's pipeline alone did not produce a usable pinch on these hands, so the
+deployed path adds the following. None of it is in the paper, and none of it is
+claimed as a reproduction of it:
+
+| Addition | Why | Where |
+|---|---|---|
+| `CrossFingerMapper` — thumb sub-net also sees the other fingers' positions | The paper's strict per-finger factorization means the thumb sub-net cannot see the index finger at all, so the mapped thumb-index gap barely moved (95→76 mm) as the real gap went 80→0 mm: the hand could not pinch | `anydexrt/models.py` |
+| `pinch_mode="continuous"` — blend toward a pinch pose by the *real* thumb-finger distance, no classifier | `f_c` has precision/recall 0.00 on ring and pinky here (never fires), and where it does fire it replaces the whole pose in one frame | `anydexrt/inference.py` |
+| Hand-calibrated pinch and fist poses | Every automatic template-scoring rule tried (gap, palm distance, direction alignment, joint engagement) was rejected on inspection; `_tip_offsets` put the measured "fingertip" 10–11 mm beyond the visible mesh surface, so all of them scored against a wrong reference | `scripts/calibrate_pinch.py`, `scripts/calibrate_fist.py` |
+| Fist refinement, gated on thumb straightness | Zeroing a curled finger's slot in the thumb context is out-of-distribution for the net; the thumb landed far from the palm. A *mm* threshold cannot tell a fist from an extended thumb on PICO 4 (both 90–122 mm), a shape ratio can on both devices | `anydexrt/inference.py` |
+| Joint-space low-pass + stronger NNS continuity prior | `f_s` is a discrete lookup, so tracking noise becomes joint jitter — see [Jitter with a still hand](#jitter-with-a-still-hand) | `anydexrt/inference.py`, `anydexrt/kinematics.py` |
+| PICO 4 wire protocol client | Independent reimplementation, so the live path does not depend on another repository | `anydexrt/pico.py` |
+
 Dependencies are deliberately narrow: `mujoco`, `torch`, `numpy`, `scipy`. This
 does **not** depend on `mimic_retargeter_lab`, whose JAX/hydra/dash stack is
 unrelated to the method.
@@ -42,10 +57,14 @@ unrelated to the method.
 conda activate anydex          # mujoco + torch + numpy + scipy
 export PYTHONPATH=/home/qsq/qqsq12321/anydexRT
 
-pytest tests/ -q                                   # 29 unit tests
+pytest tests/ -q                                   # 117 unit tests
 python scripts/validate_chamfer_collapse.py        # rung 1 alone
 python scripts/run_ladder.py --epochs 60           # the full ladder
 ```
+
+For the AVP / PICO 4 → L20 path that is actually deployed, see
+[Two kept bundles](#two-kept-bundles-one-per-capture-device) — train with
+`scripts/train_bundle.py`, run live with `scripts/teleop_avp.py`.
 
 The hand models come from `mimic_retargeter_lab/assets/mjcf`, and the human
 captures from `mimic_retargeter_lab/dataset/manus`. Both paths are overridable
@@ -61,13 +80,15 @@ from anydexrt.inference import AnyDexRT, make_pinch_templates
 spec = get_hand("leap_hand")
 raw, quats = load_manus_npz(capture_path, spec)
 samples = normalize_human(raw, quats, spec.finger_names)
-clouds, kin = build_robot_clouds(spec, n_samples=20000, normalizer=samples.normalizer)
+# The robot cloud gets its OWN per-finger normalizer (see errata 4) -- do not
+# pass the human one here.
+clouds, kin = build_robot_clouds(spec, n_samples=20000, frame="palm")
 anchors = build_anchor_set(spec, raw, samples.normalizer, kin,
-                           robot_normalizer=samples.normalizer)
+                           robot_normalizer=clouds.normalizer)
 
 result = train(samples, clouds, anchors, TrainConfig(hand="leap_hand"), raw_fingertips=raw)
-rt = AnyDexRT(result.mapper, clouds, samples.normalizer,
-              result.classifier, make_pinch_templates(clouds))
+rt = AnyDexRT(result.mapper, clouds, kin, samples.normalizer,
+              result.classifier, make_pinch_templates(clouds, kin))
 qpos = rt.retarget_sequence(raw)          # (T, F, 3) -> (T, J)
 ```
 
@@ -352,19 +373,101 @@ What the tables say, read carefully:
   template snapping. GMC also rewards direction preservation, which the optimizer
   deliberately trades away (segment scalings, pinch attraction), so it is not a
   neutral metric for that comparison.
-- **Speed.** ~1200 Hz end to end on CPU vs 38–59 Hz for the SLSQP optimizer.
+- **Speed.** ~1300 Hz end to end on CPU vs 38–59 Hz for the SLSQP optimizer.
+
+### Jitter with a still hand
+
+`f_s` is a discrete table lookup, so fingertip tracking noise becomes joint
+jitter even when the operator is not moving. Measured on a PICO 4 session with
+the hand held still: 0.53 mm/frame of fingertip noise, amplified ~8× by `f_m`
+to 4.2 mm/frame of target motion, which selected table entries up to **71 % of
+a joint's range apart** in a single frame.
+
+The continuity prior is what suppresses this, and its two defaults were both too
+weak to: `prior_weight` 0.05 contributed 0.004–0.011 to the cost while the
+candidates' own tip distances spanned 0.002–0.008 (same order, so the prior
+rarely decided anything), and `n_candidates` 8 often did not even contain the
+continuous-looking entry. Now **32 candidates, weight 0.5**, measured over three
+recording/bundle combinations:
+
+| | jitter, all frames | jitter, still frames | tip error |
+|---|---|---|---|
+| PICO rec / AVP bundle | 0.733 → **0.553** | 0.114 → **0.073** | 16.8 → 18.2 mm |
+| AVP rec / AVP bundle | 1.439 → **1.166** | 0.377 → **0.261** | 17.7 → 19.0 mm |
+| PICO rec / PICO bundle | 0.670 → **0.497** | 0.118 → **0.068** | 13.5 → 14.7 mm |
+
+(% of joint range per frame, after the 6 Hz output filter.) Jitter drops ~25 %
+overall and ~38 % when still, and the trade is real: the lookup now accepts a
+slightly worse tip match to stay continuous, costing 1.1–1.4 mm of tip error,
+and 32 candidates cost ~1586 → ~1282 Hz. Worst-case single-frame jump did not
+improve (25.2 % → 26.9 %) — the prior reduces how often a far entry wins, not
+how far the farthest one is.
+
+A deadband on target motion (skip the lookup below a threshold) was tried and
+**removed**: requiring all five fingers under 0.0008 fired on only 2.4 % of
+frames and changed jitter by 0.001, because a hand that is "still" to the eye
+still has one finger drifting above any threshold loose enough to be safe.
 
 ### Live use
 
 ```python
 from anydexrt.inference import load_bundle
-rt = load_bundle("results/avp/linker_l20/linker_l20_bundle.pt")   # or wuji_hand
-qpos = rt.retarget_avp_poses(avp_right_fingers)   # (25, 4, 4) from avp_stream -> (16,) drives
+rt = load_bundle("results/compare/linker_l20_C_cross_finger_bundle.pt")
+qpos = rt.retarget_avp_poses(avp_right_fingers)       # (25, 4, 4) from avp_stream -> (16,) drives
+qpos = rt.retarget_mediapipe_points(pico_right_hand)  # (21, 3) from anydexrt.pico -> same
 ```
 
-`retarget_avp_poses` rebuilds the palm frame from each live frame's own skeleton,
-so no stored calibration is needed. Drives are in `rt.kin.hand.joint_names`
-order; coupled joints (L20 DIP/IP) follow via `rt.kin.hand.drive_targets`.
+Both entry points rebuild the palm frame from each live frame's own skeleton, so
+no stored calibration is needed. Drives are in `rt.kin.hand.joint_names` order;
+coupled joints (L20 DIP/IP) follow via `rt.kin.hand.drive_targets`.
+
+### Two kept bundles, one per capture device
+
+`scripts/train_bundle.py` trains one deployable CrossFingerMapper bundle from a
+recording — either device, since `scripts/record_avp.py` writes the same
+(21, 3) MediaPipe pkl for both. Two are kept:
+
+| | bundle | trained on | open-hand gap (p90, mm) |
+|---|---|---|---|
+| AVP | `results/compare/linker_l20_C_cross_finger_bundle.pt` | `data/avp_20261016_143808.pkl` | 105.6 / 123.7 / 125.0 / 137.2 |
+| PICO 4 | `results/pico4/linker_l20_C_cross_finger_bundle.pt` | `data/pico4_check.pkl`, 2553 frames | 120.4 / 153.0 / 157.4 / 162.5 |
+
+Same recipe for both (300 epochs, 20000-sample palm-frame cloud, skeleton
+anchors, full loss, seed 0), so the recording is the only difference. Neither
+the bundles nor the recordings are in git (`.gitignore`: `*.pt`, `results/`,
+`data/*.pkl`) — record and train to reproduce them:
+
+```bash
+python scripts/record_avp.py --input pico4 --out data/pico4_check.pkl --seconds 40
+python scripts/train_bundle.py --rec data/pico4_check.pkl --out results/pico4
+```
+
+Then run live:
+
+```bash
+# AVP bundle, AVP input
+python scripts/teleop_avp.py --hand linker_l20 --input avp --avp-ip <headset-ip> \
+  --bundle results/compare/linker_l20_C_cross_finger_bundle.pt --pinch-mode continuous
+# PICO 4 bundle, PICO 4 input
+python scripts/teleop_avp.py --hand linker_l20 --input pico4 \
+  --bundle results/pico4/linker_l20_C_cross_finger_bundle.pt --pinch-mode continuous
+```
+
+`--input` also picks the pinch gate (`PINCH_MIN_EXTENSION_MM`: 110 mm for AVP,
+90 mm for PICO 4). PICO measures the same hand as reaching 20–35 mm less far, so
+at the AVP gate a ring or pinky pinch never engages at all. The bundle's own
+`extra['open_gap_mm']`, printed at startup, is the pinch blend's alpha=0
+reference — that is what the table's last column is, and why it differs by
+device.
+
+A bundle is **not** separable from how its robot cloud was built. `load_bundle`
+rebuilds the cloud with `frame="palm"` and the robot's own normalizer, so a
+mapper trained against a base-frame cloud, or against one normalized with the
+*human* normalizer, lands in a different space than inference looks up in:
+every finger comes out rotated and the thumb will not open. Train through
+`scripts/train_bundle.py`, which mirrors `run_avp.py`'s data path for exactly
+this reason, rather than assembling the setup by hand — this was hit twice while
+adding PICO support, silently both times, with healthy-looking loss curves.
 
 ## Errata (found while porting to Wuji / L20 / AVP)
 
@@ -396,6 +499,15 @@ treat its numbers as superseded by the AVP section below.
    normalized space, where thumb and finger have different centres and scales;
    they are now chosen in metres.
 
+Defect 4 **recurred** in 2026-10 while training the first PICO 4 bundle, from a
+hand-written training script that passed the human normalizer to
+`build_robot_clouds` and left the cloud in the base frame instead of
+`frame="palm"`. Symptom on the robot: all four fingers skewed to one angle and
+the thumb would not open, while training itself looked healthy. The lesson is
+not about the normalizer specifically — it is that the mapper and
+`load_bundle`'s cloud reconstruction have to agree, and nothing checks that they
+do. `scripts/train_bundle.py` exists so the setup is written once.
+
 ## What this does not claim
 
 - **Not the paper's numbers.** The LMC/GMC implementation is unpublished and the
@@ -412,6 +524,19 @@ treat its numbers as superseded by the AVP section below.
   measured on synthetic anchors, so it is not comparable to the paper's.
 - **Downstream policies are untested.** The paper itself leaves this open, and so
   does this reproduction.
+- **The deployed path's pinch/fist quality is judged by eye, not measured.** The
+  calibrated poses, the gate thresholds and the fist discriminator were accepted
+  or rejected by looking at the MuJoCo viewer. What *is* measured is narrower:
+  jitter and tip error (above), and whether a threshold separates two pose
+  groups on recordings. There is no metric here for "does this look like a
+  proper pinch".
+- **One operator, one short recording per device.** Every threshold in the
+  deployed path comes from this operator's hands: `data/pico4_check.pkl` is 40
+  seconds / 2553 frames, and the fist statistics behind `fist_thumb_bent` rest
+  on 140 fist frames. Several thresholds are also absolute distances in mm
+  (`pinch_min_extension_mm`, `fist_open_reach_mm`), which is why they already
+  need separate values per device — another operator will likely need them
+  retuned again.
 
 ## Layout
 
@@ -421,17 +546,29 @@ anydexrt/
   kinematics.py   MJCF forward kinematics; NNS inverse solver
   normalize.py    per-finger normalization to [-1, 1]
   frames.py       local coordinate frames, quaternion conversion
-  models.py       FingerMapper, ContactClassifier
+  models.py       FingerMapper, CrossFingerMapper, ContactClassifier
   losses.py       Eqs. (1)-(5) and the jitter
   anchors.py      Appendix D anchor generation
-  data.py         Manus loading, robot cloud sampling
+  data.py         Manus / AVP / MediaPipe loading, robot cloud sampling
   metrics.py      GMC / LMC
   train.py        training loop, checkpointing
-  inference.py    end-to-end retargeting, pinch refinement
+  inference.py    end-to-end retargeting, pinch + fist refinement, bundles
+  avp.py          Apple Vision Pro skeleton handling
+  pico.py         PICO 4 wire protocol client (relay + direct), independent impl
 scripts/
+  train_bundle.py                train one deployable bundle from a recording
+  run_avp.py                     the AVP ablation ladder + evaluation
+  teleop_avp.py                  live AVP / PICO 4 -> MuJoCo (and --real L20)
+  record_avp.py                  record either device to a (21, 3) pkl
+  pico4_daemon.py                PICO 4 relay daemon
+  calibrate_pinch.py             hand-tune the four pinch poses in the viewer
+  calibrate_fist.py              hand-tune the natural fist pose
   validate_chamfer_collapse.py   rung 1 in isolation
   run_ladder.py                  the full ladder
-tests/           29 unit tests (losses, metrics, normalization, frames)
+calibrated_pinch_poses.yaml      output of calibrate_pinch.py (L20)
+calibrated_fist_pose.yaml        output of calibrate_fist.py (L20)
+tests/           117 unit tests (losses, metrics, normalization, frames,
+                 smoothing, AVP, PICO protocol round-trips)
 ```
 
 ## Licence note

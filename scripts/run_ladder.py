@@ -133,6 +133,8 @@ class Runner:
             epochs=epochs,
             seed=seed,
             use_anchors=use_anchors,
+            mapper_type="finger",  # paper's own ablation ladder -- pin the paper-faithful
+                                   # architecture regardless of TrainConfig's default
             weights={
                 "p_chamfer": weights.p_chamfer,
                 "dist": weights.dist,

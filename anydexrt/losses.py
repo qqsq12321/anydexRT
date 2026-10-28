@@ -129,6 +129,7 @@ def local_motion_loss(
     human_rot: torch.Tensor | None = None,
     robot_cloud: torch.Tensor | None = None,
     robot_cloud_rot: torch.Tensor | None = None,
+    context: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Eq (3): motion directions must agree after rotating into local frames.
 
@@ -147,16 +148,26 @@ def local_motion_loss(
         robot_cloud, robot_cloud_rot: (M, 3) and (M, 3, 3) for the robot side.
             When provided, the robot frame is the nearest neighbour's rotation,
             per the paper. When None, the robot side defaults to global too.
+        context: (N, C) other-fingers context for `mapper.forward_finger`, only
+            meaningful when `finger` is a CrossFingerMapper thumb net and
+            `mapper` accepts the `context` kwarg. Held FIXED across both the
+            jittered and un-jittered evaluation (only this finger's own point
+            moves), then broadcast over `B`. None for a plain FingerMapper.
 
     Returns:
         Scalar loss for this finger.
     """
     B, N, _ = source.shape
 
+    def _map(pts: torch.Tensor) -> torch.Tensor:
+        flat = pts.reshape(-1, 3)
+        if context is None:
+            return mapper.forward_finger(flat, finger).reshape(B, N, 3)
+        ctx = context.unsqueeze(0).expand(B, N, -1).reshape(-1, context.shape[-1])
+        return mapper.forward_finger(flat, finger, context=ctx).reshape(B, N, 3)
+
     d_x = delta
-    d_f = mapper.forward_finger((source + delta).reshape(-1, 3), finger).reshape(
-        B, N, 3
-    ) - mapper.forward_finger(source.reshape(-1, 3), finger).reshape(B, N, 3)
+    d_f = _map(source + delta) - _map(source)
 
     eps = 1e-5
     d_x_hat = F.normalize(d_x, dim=-1, eps=eps)
@@ -260,11 +271,15 @@ def mapping_loss(
     anchors: tuple[torch.Tensor, torch.Tensor] | None = None,
     jitter_base: float = 0.001,
     jitter_rand: float = 0.01,
+    human_paired: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Total L_mapping over all fingers, plus a detached per-term breakdown.
 
     Args:
-        mapper: FingerMapper.
+        mapper: FingerMapper, or CrossFingerMapper (duck-typed via a
+            `thumb_idx` attribute -- when present, the thumb finger's forward
+            pass is given the other fingers' same-frame context from
+            `human_paired`).
         human: (F, N, 3) normalized human fingertip samples: one set of N
             samples per finger. N is the objective's sample set, so it must be
             >= 2 for L_dist to have any pairs.
@@ -272,6 +287,12 @@ def mapping_loss(
         weights: which terms to include and how heavily.
         anchors: optional ((F, M_a, 3) human, (F, M_a, 3) robot) paired anchors.
         human_rot, robot_cloud_rot: (F, N, 3, 3) and (F, M, 3, 3) local frames.
+        human_paired: (N, F, 3) SAME-FRAME human fingertips across the finger
+            axis (i.e. `human.permute(1, 0, 2)`, same N samples, same frame
+            order). Required when `mapper` is cross-finger-aware (gives the
+            thumb sub-net its context, used by every active loss term that
+            touches the thumb -- not just one of them). None is fine for a
+            plain FingerMapper.
 
     Returns:
         (total_loss, {'p_chamfer': float, 'dist': float, ...}) summed over
@@ -282,9 +303,18 @@ def mapping_loss(
     total = human.sum() * 0.0
     log: dict[str, float] = {}
 
+    is_cross_finger = hasattr(mapper, "thumb_idx")
+    thumb_idx = getattr(mapper, "thumb_idx", 0)
+
     for i in range(n_fingers):
         x = human[i].unsqueeze(0)  # (1, N, 3)
-        mapped = mapper.forward_finger(x.reshape(-1, 3), i).reshape(x.shape)
+        finger_context = None
+        if is_cross_finger and i == thumb_idx and human_paired is not None:
+            finger_context = mapper.context_from_paired(human_paired)
+        if finger_context is not None:
+            mapped = mapper.forward_finger(x.reshape(-1, 3), i, context=finger_context).reshape(x.shape)
+        else:
+            mapped = mapper.forward_finger(x.reshape(-1, 3), i).reshape(x.shape)
         cloud = robot_cloud[i]
 
         if "p_chamfer" in active:
@@ -309,6 +339,7 @@ def mapping_loss(
                 human_rot=None if human_rot is None else human_rot[i].unsqueeze(0),
                 robot_cloud=cloud,
                 robot_cloud_rot=None if robot_cloud_rot is None else robot_cloud_rot[i],
+                context=finger_context,
             )
             total = total + weights.motion * term
             log["motion"] = float(term.detach())

@@ -1,33 +1,70 @@
-"""Live teleoperation in simulation: Apple Vision Pro -> AnyDexRT -> MuJoCo.
+"""Live teleoperation in simulation: Apple Vision Pro / PICO 4 -> AnyDexRT -> MuJoCo.
 
 Streams the hand skeleton from the Vision Pro (avp_stream / Tracking Streamer
-app), retargets every frame with a trained AnyDexRT bundle, and shows the robot
-hand in the MuJoCo viewer.
+app) or a PICO 4 (anydexrt.pico, an independent reimplementation of its wire
+protocol), retargets every frame with a trained AnyDexRT bundle, and shows the
+robot hand in the MuJoCo viewer.
 
     python scripts/teleop_avp.py --hand linker_l20 --avp-ip 192.168.50.127
     python scripts/teleop_avp.py --hand wuji_hand  --avp-ip 192.168.50.127
+    python scripts/teleop_avp.py --hand linker_l20 --input pico4
 
-Without a headset, `--replay` feeds a recording through the same code path:
+Without a headset, `--replay` feeds a recording through the same code path --
+both AVP and PICO 4 recordings are the same pkl format (see
+scripts/record_avp.py), so pass `--input` to match whichever device the
+recording came from (default: avp):
 
     python scripts/teleop_avp.py --hand linker_l20 --replay
+    python scripts/teleop_avp.py --hand linker_l20 --input pico4 --replay data/pico4_20261022.pkl
 
 No calibration step: the palm frame is rebuilt from each live frame's own
 skeleton, so the headset's position and the wrist frame's orientation do not
 matter. The bundle was trained on avp1.pkl (one operator); for another operator,
 record their hand and retrain with scripts/run_avp.py --avp <file>.
 
+PICO 4 (`--input pico4`): uses anydexrt.pico.Pico4, which already outputs the
+same (21, 3) MediaPipe-order, wrist-relative point format the AVP recordings
+use (see anydexrt.data.palm_tips_from_mediapipe_points) -- no retraining
+needed, same palm-frame construction, just a different capture device feeding
+it. Two modes:
+
+    --pico4-mode relay (default)   connect to a relay daemon already running on
+                                   127.0.0.1:63902 -- start it first in another
+                                   terminal: `python scripts/pico4_daemon.py`.
+                                   Convenient for repeated restarts of this
+                                   script without re-pairing the headset.
+    --pico4-mode direct            this script itself opens the TCP server
+                                   (63901) and UDP discovery broadcast (29888)
+                                   the headset connects to -- no extra process,
+                                   but the headset re-pairs on every restart.
+
 Output is low-pass filtered in joint space by default (`--smoothing-hz 6`,
 disable with `--smoothing-hz 0`) -- the raw NNS lookup hunts between nearby
 table entries as the target moves, and pinch-template snapping is a discrete
 jump; both are visible as jitter without this. See
-anydexrt.inference.JointLowPassFilter.
+anydexrt.inference.JointLowPassFilter. The lookup's own continuity prior
+(NearestNeighborIK: 32 candidates, weight 0.5) does most of the work now --
+raised from 8/0.05, which measured too weak to decide anything; see the README's
+"Jitter with a still hand".
 
-f_c pinch-template snapping is OFF by default (`--pinch` to enable). As
-measured on the current bundles: the ring/pinky contact classifiers have
-precision/recall of 0.00 (they never fire), and even where it works the snap
-replaces the whole pose in one frame at a 13mm-gap threshold, which looks like
-the robot closing on the human fingers well before they visually touch. Needs
-the fixes in README errata before this is worth turning back on.
+Pinch assist is OFF by default (`--pinch-mode off`). Three modes:
+
+    --pinch-mode classifier   f_c decides contact on/off, hard pose-swap on
+                              trigger. Needs a trained, working classifier --
+                              as measured on the current bundles, the
+                              ring/pinky contact classifiers have
+                              precision/recall of 0.00 (they never fire), and
+                              even where it works the snap replaces the whole
+                              pose in one frame (see README errata).
+    --pinch-mode continuous  NO classifier; blends toward the pinch template
+                              in proportion to the REAL thumb-finger distance
+                              (dominant finger only), so a 1cm/2cm partial
+                              pinch produces a proportionally part-closed pose
+                              instead of a jump. Trained with a CrossFingerMapper
+                              (TrainConfig.mapper_type, default since the pinch
+                              comparison -- a plain FingerMapper's mapped gap
+                              barely tracks the real one).
+    --pinch-mode off          (default) raw f_m output, no pinch assist.
 
 Real hardware (Linker L20 only, via AnyDexRetarget's RS485 driver):
 
@@ -57,6 +94,7 @@ from pathlib import Path
 import mujoco
 import mujoco.viewer
 import numpy as np
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -67,6 +105,21 @@ from anydexrt.data import VP_TO_MEDIAPIPE  # noqa: E402
 from anydexrt.inference import load_bundle  # noqa: E402
 
 DEFAULT_REPLAY = "/home/qsq/qqsq12321/AnyDexRetarget/example/data/avp1.pkl"
+
+# How far a fingertip must reach from the palm origin before the pinch blend
+# engages for it (--pinch-min-extension-mm), per capture device.
+#
+# PICO 4 needs a lower gate than AVP because it measures the same hand as
+# reaching 20-35mm less far: on recordings, median fingertip reach is 140 /
+# 153 / 137 / 139mm (index..pinky) vs AVP's 171 / 176 / 166 / 148mm. At the
+# AVP gate of 110mm, pinching the ring or pinky -- where the finger is already
+# partly curled -- drops below the gate and the blend never engages: the robot
+# fingertips stay 12mm and 20mm apart at full human pinch, versus 7mm and 8mm
+# at a 92mm gate. The cost of a lower gate is a curled finger occasionally
+# reading as "reaching": on AVP, frames with a bent thumb that pick up a pinch
+# weight above 0.3 go from 11.1% at 110mm to 14.8% at 90mm, which is why AVP
+# keeps its own value rather than both sharing one.
+PINCH_MIN_EXTENSION_MM = {"avp": 110.0, "pico4": 90.0}
 
 
 class LiveAVP:
@@ -93,22 +146,31 @@ class LiveAVP:
             stop()
 
 
-class ReplayAVP:
-    """A 21-landmark recording lifted back to the 25-joint skeleton, looped.
+class ReplayRecording:
+    """A (21, 3) MediaPipe-landmark recording, looped -- same pkl format
+    regardless of capture device (see scripts/record_avp.py), since the live
+    path for both AVP and PICO 4 already reduces to this exact representation.
 
-    Metacarpal joints (5, 10, 15, 20), which the palm frame does not use, are
-    filled with wrist-MCP midpoints.
+    `pad_to_avp=True` (AVP replay) additionally lifts the 21 points back to
+    the 25-joint AVP skeleton for `retarget_avp_poses` -- metacarpal joints
+    (5, 10, 15, 20), which the palm frame does not use, are filled with
+    wrist-MCP midpoints. `pad_to_avp=False` (PICO 4 replay) returns the 21
+    points directly, for `retarget_mediapipe_points` -- PICO's live path
+    already consumes this exact format, no padding needed.
     """
 
-    def __init__(self, path: str, side: str):
+    def __init__(self, path: str, side: str, pad_to_avp: bool = True):
         with open(path, "rb") as fh:
             frames = pickle.load(fh)
         self.frames = [np.asarray(f[f"{side}_fingers"], dtype=np.float64) for f in frames]
         self.i = 0
+        self.pad_to_avp = pad_to_avp
 
     def poses(self) -> np.ndarray:
         mp = self.frames[self.i]
         self.i = (self.i + 1) % len(self.frames)
+        if not self.pad_to_avp:
+            return mp
         poses = np.tile(np.eye(4), (25, 1, 1))
         for mp_idx, vp_idx in enumerate(VP_TO_MEDIAPIPE):
             poses[vp_idx, :3, 3] = mp[mp_idx]
@@ -120,20 +182,110 @@ class ReplayAVP:
         pass
 
 
+class LivePico:
+    """Latest (21, 3) wrist-relative MediaPipe hand skeleton from a PICO 4.
+
+    Thin wrapper around anydexrt.pico.Pico4, which already does the SDK's
+    26-joint -> 21-point MediaPipe reduction and wrist-relative normalization.
+    Constructing `Pico4(...)` starts its background connect/listen thread
+    immediately -- no separate start() call.
+    """
+
+    def __init__(self, side: str, mode: str, relay_host: str, relay_port: int,
+                 port: int, broadcast_port: int):
+        from anydexrt.pico import Pico4
+
+        self.dev = Pico4(mode=mode, relay_host=relay_host, relay_port=relay_port,
+                          port=port, broadcast_port=broadcast_port)
+        self.key = f"{side}_fingers"
+
+    def poses(self) -> np.ndarray | None:
+        arr = self.dev.get_fingers_data()[self.key]
+        return arr if np.any(arr) else None  # all-zero = no frame received yet
+
+    def close(self) -> None:
+        self.dev.stop()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hand", default="linker_l20", choices=["linker_l20", "wuji_hand"])
+    ap.add_argument("--input", default="avp", choices=["avp", "pico4"],
+                    help="live input device (default: avp). --replay is AVP-only.")
     ap.add_argument("--avp-ip", default="10.10.10.126")
     ap.add_argument("--side", default="right", choices=["right", "left"],
                     help="left is mirrored onto the right-hand model")
     ap.add_argument("--replay", nargs="?", const=DEFAULT_REPLAY, default=None,
-                    help="feed a recording instead of the headset (default: avp1.pkl)")
+                    help="feed a recording instead of the headset (default: avp1.pkl). Works "
+                         "for both --input avp and --input pico4 recordings (same pkl format).")
+    pico4 = ap.add_argument_group("pico4", "only used with --input pico4")
+    pico4.add_argument("--pico4-mode", default="relay", choices=["relay", "direct"],
+                       help="relay daemon (default; run scripts/pico4_daemon.py first) or "
+                            "direct TCP server (self-contained, no extra process)")
+    pico4.add_argument("--pico4-relay-host", default="127.0.0.1")
+    pico4.add_argument("--pico4-relay-port", type=int, default=63902)
+    pico4.add_argument("--pico4-port", type=int, default=63901)
+    pico4.add_argument("--pico4-broadcast-port", type=int, default=29888)
     ap.add_argument("--bundle", default=None, help="default: results/avp/<hand>/<hand>_bundle.pt")
     ap.add_argument("--fps", type=float, default=60.0)
     ap.add_argument("--smoothing-hz", type=float, default=6.0,
                     help="joint-space low-pass cutoff; 0 disables (raw NNS output, visibly jittery)")
-    ap.add_argument("--pinch", action="store_true",
-                    help="enable f_c pinch-template snapping (off by default, see module docstring)")
+    ap.add_argument("--pinch-mode", default="off", choices=["off", "classifier", "continuous"],
+                    help="how f_c/pinch-templates refine the mapped pose (default: off). "
+                         "'classifier': f_c decides contact on/off, hard pose-swap on trigger -- "
+                         "ring/pinky heads currently have 0 precision/recall, and even when it "
+                         "fires it snaps instantly (see README errata). "
+                         "'continuous': NO classifier; blends toward the pinch template in "
+                         "proportion to the REAL thumb-finger distance (dominant finger only), "
+                         "so a 1cm/2cm partial pinch produces a proportionally part-closed pose "
+                         "instead of a jump -- works best with a CrossFingerMapper bundle. "
+                         "'off': raw f_m output, no pinch assist at all.")
+    ap.add_argument("--pinch-open-gap-mm", type=float, default=80.0,
+                    help="'continuous' mode only: thumb-finger distance (mm) treated as the "
+                         "fully-open reference (alpha=0). If the bundle's extra['open_gap_mm'] "
+                         "is present, that is used per-finger instead and this flag is ignored.")
+    ap.add_argument("--pinch-closed-gap-mm", type=float, default=6.0,
+                    help="'continuous' mode only: thumb-finger distance (mm) treated as the "
+                         "fully-pinched reference (alpha=1). Real AVP tracking never reports "
+                         "exactly 0mm even at a hard pinch (finger meshes have physical "
+                         "thickness); defaults to 6mm based on recorded sessions. Raise this if "
+                         "the robot still isn't closing all the way, lower it if it over-closes "
+                         "before your fingers actually touch.")
+    ap.add_argument("--pinch-min-extension-mm", type=float, default=None,
+                    help="'continuous' mode only: a finger must reach at least this far from the "
+                         "palm origin before the pinch blend engages for it. Without this, making "
+                         "a fist can accidentally trigger a pinch (a curled finger's tip can land "
+                         "within a few mm of the thumb even though it's curled INTO the palm, not "
+                         "reaching OUT toward the thumb). Defaults per device (see "
+                         "PINCH_MIN_EXTENSION_MM): 110mm for AVP, 90mm for PICO 4.")
+    ap.add_argument("--fist-thumb-rest-mm", type=float, default=110.0,
+                    help="'continuous' mode only: with all four fingers curled, a human thumb tip "
+                         "this close to the palm origin (or closer) counts as wrapped in a fist and "
+                         "the robot thumb goes fully to calibrated_fist_pose.yaml.")
+    ap.add_argument("--fist-thumb-extended-mm", type=float, default=125.0,
+                    help="...and at this distance or farther the thumb counts as extended, no fist "
+                         "blend (recordings: fist 95-105mm, extended 130-145mm). 0 disables the "
+                         "fist blend entirely. Only used as a FALLBACK -- the live paths pass a "
+                         "thumb straightness ratio instead, which works on both AVP and PICO 4 "
+                         "(a mm threshold only separates the two poses on AVP). The status line "
+                         "prints thumb_reach live.")
+    ap.add_argument("--fist-thumb-bent", type=float, default=0.92,
+                    help="With all four fingers curled, a thumb straightness "
+                         "(anydexrt.data.thumb_straightness, 1.0 = MCP/IP/TIP collinear) at or "
+                         "below this counts as wrapped in a fist: the robot thumb goes fully to "
+                         "calibrated_fist_pose.yaml.")
+    ap.add_argument("--fist-thumb-straight", type=float, default=0.95,
+                    help="...and at or above this the thumb counts as extended, no fist blend. "
+                         "Measured on both devices: curled < 0.88, extended > 0.94. The status "
+                         "line prints the live value as 'straight'. Both peaks are the same "
+                         "on AVP and PICO 4: curled below 0.88, valley at 0.90, extended above "
+                         "0.94. Lower --fist-thumb-bent toward 0.88 for a stricter fist.")
+    ap.add_argument("--fist-open-reach-mm", type=float, default=110.0,
+                    help="How far a fingertip must be from the palm origin to count as fully "
+                         "open for the FIST blend (the other half of its weight, alongside "
+                         "--fist-thumb-bent). Deliberately separate from --pinch-min-extension-mm: "
+                         "that one drops to ~90 on PICO 4, which would leave the fist only a 10mm "
+                         "window to ramp over instead of 30mm.")
     ap.add_argument("--real", action="store_true",
                     help="also drive the physical Linker L20 over RS485. Needs --confirm-real "
                          "too, or runs dry (prints registers, sends nothing).")
@@ -152,10 +304,42 @@ def main() -> int:
         return 1
 
     bundle = args.bundle or ROOT / "results/avp" / args.hand / f"{args.hand}_bundle.pt"
-    rt = load_bundle(bundle, smoothing_hz=args.smoothing_hz or None, use_contacts=args.pinch)
+    # A bundle may carry its own per-finger open-hand reference in
+    # extra['open_gap_mm'] (estimated from that bundle's OWN training
+    # recording's 90th-percentile spread); prefer that over the flat
+    # --pinch-open-gap-mm default, which is a guess if the bundle doesn't say
+    # otherwise.
+    open_gap = args.pinch_open_gap_mm
+    try:
+        _extra = torch.load(bundle, map_location="cpu", weights_only=False).get("extra", {})
+        if "open_gap_mm" in _extra:
+            open_gap = _extra["open_gap_mm"]
+            print(f"using bundle's own open-hand gap estimate: {[round(g, 1) for g in open_gap]} mm")
+    except Exception:
+        pass  # fall back to the flat default; load_bundle will raise its own error below if the file is bad
+    rt = load_bundle(bundle, smoothing_hz=args.smoothing_hz or None,
+                     use_contacts=(args.pinch_mode == "classifier"),
+                     pinch_mode=args.pinch_mode, pinch_open_gap_mm=open_gap,
+                     pinch_closed_gap_mm=args.pinch_closed_gap_mm,
+                     pinch_min_extension_mm=(args.pinch_min_extension_mm
+                                             if args.pinch_min_extension_mm is not None
+                                             else PINCH_MIN_EXTENSION_MM[args.input]),
+                     fist_thumb_rest_mm=args.fist_thumb_rest_mm,
+                     fist_thumb_extended_mm=args.fist_thumb_extended_mm,
+                     fist_thumb_bent=args.fist_thumb_bent,
+                     fist_thumb_straight=args.fist_thumb_straight,
+                     fist_open_reach_mm=args.fist_open_reach_mm)
     kin = rt.kin
-    source = ReplayAVP(args.replay, args.side) if args.replay else LiveAVP(args.avp_ip, args.side)
-    print(f"{args.hand} <- {'replay ' + args.replay if args.replay else 'AVP ' + args.avp_ip} ({args.side} hand)")
+    if args.replay:
+        source = ReplayRecording(args.replay, args.side, pad_to_avp=(args.input == "avp"))
+        print(f"{args.hand} <- replay {args.replay} ({args.input}, {args.side} hand)")
+    elif args.input == "pico4":
+        source = LivePico(args.side, args.pico4_mode, args.pico4_relay_host, args.pico4_relay_port,
+                           args.pico4_port, args.pico4_broadcast_port)
+        print(f"{args.hand} <- PICO 4 ({args.pico4_mode} mode) ({args.side} hand)")
+    else:
+        source = LiveAVP(args.avp_ip, args.side)
+        print(f"{args.hand} <- AVP {args.avp_ip} ({args.side} hand)")
 
     real_driver = None
     if args.real:
@@ -184,13 +368,14 @@ def main() -> int:
     mirror = np.array([-1.0, 1.0, 1.0]) if args.side == "left" else None
 
     frames, lost, t_report = 0, 0, time.perf_counter()
-    # avp_stream's get_latest() is non-blocking: it returns whatever snapshot is
-    # currently cached, not "the next new frame". If the Vision Pro delivers
-    # slower than this loop polls, the same snapshot gets read (and retargeted)
-    # several times in a row -- the robot holds a pose, then jumps when a new
-    # sample finally lands, which looks identical to over-smoothing but has
-    # nothing to do with the filter. Comparing consecutive raw arrays tells
-    # the two apart: see the printed "new AVP samples" rate below.
+    # Both LiveAVP's and LivePico's poses() are non-blocking: they return
+    # whatever snapshot is currently cached, not "the next new frame". If the
+    # headset delivers slower than this loop polls, the same snapshot gets
+    # read (and retargeted) several times in a row -- the robot holds a pose,
+    # then jumps when a new sample finally lands, which looks identical to
+    # over-smoothing but has nothing to do with the filter. Comparing
+    # consecutive raw arrays tells the two apart: see the printed "new
+    # samples" rate below.
     fresh, stale, window_t0 = 0, 0, time.perf_counter()
     prev_raw = None
     try:
@@ -214,13 +399,17 @@ def main() -> int:
                     prev_raw = poses
                     if mirror is not None:
                         poses = poses.copy()
-                        poses[:, :3, 3] *= mirror
+                        if args.input == "pico4":
+                            poses *= mirror  # (21, 3) points, no rotation component to skip
+                        else:
+                            poses[:, :3, 3] *= mirror
                     try:
-                        qpos = rt.retarget_avp_poses(poses)
+                        qpos = (rt.retarget_mediapipe_points(poses) if args.input == "pico4"
+                                else rt.retarget_avp_poses(poses))
                         frames += 1
                     except ValueError:
-                        # Untracked hand: avp_stream sends a zero/identity placeholder,
-                        # whose palm is degenerate. Hold the last pose.
+                        # Untracked hand: source sends a zero/identity/degenerate
+                        # placeholder, whose palm is degenerate. Hold the last pose.
                         lost += 1
                 data.qpos[:] = kin._expand_drives(qpos)
                 mujoco.mj_forward(model, data)
@@ -233,8 +422,15 @@ def main() -> int:
                     contact = rt.last_contacts
                     pinch = ",".join(kin.hand.finger_names[i + 1] for i in np.where(contact)[0]) \
                         if contact is not None and contact.any() else "-"
-                    print(f"  {frames} frames, {lost} untracked | new AVP samples: {fresh} "
+                    print(f"  {frames} frames, {lost} untracked | new samples: {fresh} "
                           f"({fresh / elapsed:.1f} Hz), repeated reads: {stale} | pinch: {pinch}")
+                    fist = rt.last_fist
+                    if fist is not None:
+                        print(f"    fist: finger_reach_max={fist['finger_reach_max_mm']:.0f}mm "
+                              f"thumb_reach={fist['thumb_reach_mm']:.0f}mm "
+                              + (f"straight={fist['straightness']:.2f} "
+                                 if fist['straightness'] is not None else "")
+                              + f"alpha={fist['alpha']:.2f}")
                     fresh, stale, window_t0 = 0, 0, time.perf_counter()
                     t_report = time.perf_counter()
                 time.sleep(max(0.0, 1.0 / args.fps - (time.perf_counter() - t0)))

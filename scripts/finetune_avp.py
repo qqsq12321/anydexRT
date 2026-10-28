@@ -141,6 +141,11 @@ def main() -> int:
         weights=FULL_WEIGHTS, use_anchors=True,
         width=base_cfg["width"], depth=base_cfg["depth"],
         activation=base_cfg["activation"], output_tanh=base_cfg["output_tanh"],
+        # Must match the base bundle's own architecture, not TrainConfig's
+        # default -- init_mapper_state below is that bundle's state_dict, and
+        # a mismatched mapper_type makes load_state_dict fail on shape.
+        mapper_type=base_cfg.get("mapper_type", "finger"),
+        thumb_idx=base_cfg.get("thumb_idx", 0),
     )
 
     mapper_init_state = payload["mapper"]

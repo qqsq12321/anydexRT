@@ -327,6 +327,19 @@ class NearestNeighborIK:
     nearest table entries, the one closest to the previous solution in that
     finger's joint space wins, which suppresses frame-to-frame flips between
     distant configurations that reach the same tip.
+
+    Two things the prior needs to actually work, both measured on a PICO 4
+    session with the hand held still (`prior_weight=0.05`, `n_candidates=8`):
+
+    * **Weight.** The prior contributed at most 0.004-0.011 to the cost while
+      the candidates' own tip distances spanned 0.002-0.008 -- same order, so a
+      table entry 0.22 of a joint span away could still win on a hair's
+      difference in tip distance. Single-frame jumps reached 71% of a joint's
+      range with the fingertips barely moving.
+    * **Candidate count.** The prior can only choose among the k entries pulled
+      from the tree, so if the continuous-looking entry is not in the k nearest
+      by tip distance, no weight saves it. 8 was too few for a 20000-sample
+      cloud.
     """
 
     def __init__(
@@ -334,8 +347,8 @@ class NearestNeighborIK:
         kin: HandKinematics,
         qpos: np.ndarray,
         tips: np.ndarray,
-        n_candidates: int = 8,
-        prior_weight: float = 0.05,
+        n_candidates: int = 32,
+        prior_weight: float = 0.5,
     ):
         from scipy.spatial import cKDTree
 

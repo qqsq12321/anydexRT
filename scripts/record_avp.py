@@ -1,4 +1,4 @@
-"""Record a new Apple Vision Pro hand-tracking session for training AnyDexRT.
+"""Record an Apple Vision Pro or PICO 4 hand-tracking session for training AnyDexRT.
 
 Fixes the duplicate-frame bug found in avp1.pkl: avp_stream's get_latest() is
 non-blocking and returns whatever snapshot is currently cached, so polling
@@ -8,16 +8,29 @@ byte-identical to the one before them -- the true distinct-sample rate is
 ~24 Hz despite the file looking like a denser recording. This script only
 appends a frame when it differs from the last one saved, and stamps real
 wall-clock time (avp1.pkl's 't' field was always 0, unusable for rate checks).
+PICO 4's `get_fingers_data()` is non-blocking the same way, so the same fix
+applies to it.
 
 Output is pickled in the same [{'t', 'left_fingers', 'right_fingers'}, ...]
-format as avp1.pkl (MediaPipe 21-landmark positions, both hands every entry),
-so it drops straight into the existing pipeline:
+format as avp1.pkl (MediaPipe 21-landmark positions, both hands every entry,
+wrist-relative), regardless of which device recorded it -- PICO 4 already
+outputs this exact format natively, AVP's native (25,4,4) skeleton is reduced
+to it here (see `to_mediapipe`). Either way it drops straight into the
+existing pipeline:
 
     python scripts/record_avp.py --ip 10.10.10.126 --out data/avp_session1.pkl
+    python scripts/record_avp.py --input pico4 --out data/pico4_session1.pkl
     python scripts/run_avp.py --hands wuji_hand linker_l20 --avp data/avp_session1.pkl
     python scripts/teleop_avp.py --hand linker_l20 --replay data/avp_session1.pkl
+    python scripts/teleop_avp.py --hand linker_l20 --input pico4 --replay data/pico4_session1.pkl
 
 Ctrl+C stops and saves whatever was captured; --seconds stops automatically.
+
+PICO 4 (`--input pico4`) relay mode (default) needs its relay daemon running
+in another terminal first: `python scripts/pico4_daemon.py`. `--pico4-mode
+direct` is self-contained instead (no extra process, but the headset
+re-pairs on every restart) -- see scripts/teleop_avp.py's docstring for the
+same tradeoff.
 
 Recording protocol -- the anchor search (lateral/bending coverage) and the
 contact classifier both need this range actually present in the capture, or
@@ -66,27 +79,79 @@ def to_mediapipe(raw_25x4x4: np.ndarray) -> np.ndarray:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ip", default="10.10.10.126")
-    ap.add_argument("--out", default=None, help="default: data/avp_<timestamp>.pkl")
+    ap.add_argument("--input", default="avp", choices=["avp", "pico4"])
+    ap.add_argument("--ip", default="10.10.10.126", help="AVP only")
+    ap.add_argument("--out", default=None, help="default: data/<input>_<timestamp>.pkl")
     ap.add_argument("--seconds", type=float, default=None, help="stop automatically; default: run until Ctrl+C")
     ap.add_argument("--poll-interval-ms", type=float, default=2.0,
-                    help="breather between get_latest() polls; does not cap the saved rate")
+                    help="breather between polls; does not cap the saved rate")
     ap.add_argument("--connect-timeout", type=float, default=20.0)
+    pico4 = ap.add_argument_group("pico4", "only used with --input pico4")
+    pico4.add_argument("--pico4-mode", default="relay", choices=["relay", "direct"],
+                       help="relay daemon (default; run scripts/pico4_daemon.py first) or "
+                            "direct TCP server (self-contained, no extra process)")
+    pico4.add_argument("--pico4-relay-host", default="127.0.0.1")
+    pico4.add_argument("--pico4-relay-port", type=int, default=63902)
+    pico4.add_argument("--pico4-port", type=int, default=63901)
+    pico4.add_argument("--pico4-broadcast-port", type=int, default=29888)
     args = ap.parse_args()
 
-    from avp_stream import VisionProStreamer
-
-    out = Path(args.out) if args.out else ROOT / "data" / f"avp_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
+    out = Path(args.out) if args.out else ROOT / "data" / f"{args.input}_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Connecting to Vision Pro at {args.ip} ...")
-    streamer = VisionProStreamer(ip=args.ip, record=False)
+    # `get_frame()` returns {'right_fingers', 'left_fingers'} as (21, 3)
+    # MediaPipe-order, wrist-relative float32 arrays, or None if nothing new /
+    # untracked -- this is the one thing that differs between devices; the
+    # recording loop below is identical either way.
+    if args.input == "avp":
+        from avp_stream import VisionProStreamer
+
+        print(f"Connecting to Vision Pro at {args.ip} ...")
+        streamer = VisionProStreamer(ip=args.ip, record=False)
+
+        def get_frame():
+            data = streamer.get_latest()
+            if data is None:
+                return None
+            try:
+                right = np.asarray(data["right_fingers"], dtype=np.float64)
+                left = np.asarray(data["left_fingers"], dtype=np.float64)
+            except (KeyError, TypeError):
+                return None
+            return {"right_fingers": to_mediapipe(right), "left_fingers": to_mediapipe(left)}
+
+        def stop_source():
+            stop = getattr(streamer, "_stop_pose_streaming", None)
+            if callable(stop):
+                stop()
+    else:
+        from anydexrt.pico import Pico4
+
+        print(f"Starting PICO 4 ({args.pico4_mode} mode) ...")
+        dev = Pico4(mode=args.pico4_mode, relay_host=args.pico4_relay_host,
+                    relay_port=args.pico4_relay_port, port=args.pico4_port,
+                    broadcast_port=args.pico4_broadcast_port)
+
+        def get_frame():
+            data = dev.get_fingers_data()
+            right, left = data["right_fingers"], data["left_fingers"]
+            if not (np.any(right) or np.any(left)):
+                return None  # all-zero = no frame received yet
+            return {"right_fingers": right.astype(np.float32), "left_fingers": left.astype(np.float32)}
+
+        def stop_source():
+            dev.stop()
 
     t_connect = time.perf_counter()
-    while streamer.get_latest() is None:
+    while get_frame() is None:
         if time.perf_counter() - t_connect > args.connect_timeout:
-            print(f"no data after {args.connect_timeout:.0f}s -- check the IP and that "
-                  "Tracking Streamer is running and streaming.", file=sys.stderr)
+            if args.input == "avp":
+                print(f"no data after {args.connect_timeout:.0f}s -- check the IP and that "
+                      "Tracking Streamer is running and streaming.", file=sys.stderr)
+            else:
+                print(f"no data after {args.connect_timeout:.0f}s -- check the headset is "
+                      f"connected ({args.pico4_mode} mode; relay needs "
+                      "scripts/pico4_daemon.py running in another terminal).", file=sys.stderr)
             return 1
         time.sleep(0.1)
     print("connected.\n")
@@ -100,24 +165,19 @@ def main() -> int:
 
     try:
         while args.seconds is None or time.perf_counter() - t_start < args.seconds:
-            data = streamer.get_latest()
-            if data is None:
+            frame = get_frame()
+            if frame is None:
                 time.sleep(args.poll_interval_ms / 1000.0)
                 continue
-            try:
-                right = np.asarray(data["right_fingers"], dtype=np.float64)
-                left = np.asarray(data["left_fingers"], dtype=np.float64)
-            except (KeyError, TypeError):
-                time.sleep(args.poll_interval_ms / 1000.0)
-                continue
+            right, left = frame["right_fingers"], frame["left_fingers"]
 
             changed = (prev_right is None or not np.array_equal(right, prev_right)) or \
                       (prev_left is None or not np.array_equal(left, prev_left))
             if changed:
                 frames.append({
                     "t": time.perf_counter() - t_start,
-                    "right_fingers": to_mediapipe(right),
-                    "left_fingers": to_mediapipe(left),
+                    "right_fingers": right,
+                    "left_fingers": left,
                 })
                 prev_right, prev_left = right, left
                 saved_since_report += 1
@@ -131,9 +191,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nstopped by user.")
     finally:
-        stop = getattr(streamer, "_stop_pose_streaming", None)
-        if callable(stop):
-            stop()
+        stop_source()
 
     if not frames:
         print("nothing captured.", file=sys.stderr)

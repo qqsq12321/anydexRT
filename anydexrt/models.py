@@ -96,6 +96,96 @@ class FingerMapper(nn.Module):
         return self.nets[finger](x)
 
 
+class CrossFingerMapper(nn.Module):
+    """f_m variant: the thumb sub-net also sees the other fingers' same-frame
+    positions, so it can represent cross-finger (pinch) relationships that
+    FingerMapper's strict per-finger factorization architecturally cannot.
+
+    Measured on `FingerMapper`: mapped thumb-index gap barely moves (95.4mm ->
+    75.7mm) as the real human gap goes from 80mm to 0mm, because the thumb
+    sub-net never sees the index finger's position at all. This class widens
+    only the thumb sub-net's input, from 3 to 3 + 3*(F-1): its own position
+    plus every other finger's position, same frame, concatenated in finger
+    index order (excluding itself). Every other finger keeps the paper's plain
+    (3, width, width, 3) sub-net -- this is a minimal, targeted change aimed at
+    the one cross-finger relationship this model needs (thumb-vs-finger pinch),
+    not a general all-to-all mixing network.
+    """
+
+    def __init__(
+        self,
+        n_fingers: int,
+        thumb_idx: int = 0,
+        width: int = 128,
+        depth: int = 2,
+        activation: str = "leaky_relu",
+        output_tanh: bool = False,
+    ):
+        super().__init__()
+        if not (0 <= thumb_idx < n_fingers):
+            raise ValueError(f"thumb_idx must be in [0, {n_fingers}), got {thumb_idx}")
+        final = nn.Tanh() if output_tanh else None
+        plain_dims = [3] + [width] * depth + [3]
+        thumb_dims = [3 + 3 * (n_fingers - 1)] + [width] * depth + [3]
+        nets = []
+        for i in range(n_fingers):
+            dims = thumb_dims if i == thumb_idx else plain_dims
+            nets.append(_mlp(dims, activation, final))
+        self.nets = nn.ModuleList(nets)
+        self.n_fingers = n_fingers
+        self.thumb_idx = thumb_idx
+        self.width = width
+        self.depth = depth
+        self.activation = activation
+        self.output_tanh = output_tanh
+        # Zero placeholder for the other-fingers context when a caller maps the
+        # thumb in isolation (forward_finger with no context, e.g. call sites
+        # written against FingerMapper's single-finger signature). Zeros are a
+        # neutral, shape-compatible stand-in, not a claim about real geometry --
+        # the thumb's output degrades to FingerMapper-like blindness in that case.
+        self.register_buffer(
+            "context_placeholder", torch.zeros(3 * (n_fingers - 1)), persistent=False
+        )
+
+    def context_from_paired(self, paired: torch.Tensor) -> torch.Tensor:
+        """paired: (B, F, 3) same-frame fingertips -> (B, 3*(F-1)) thumb context."""
+        return torch.cat(
+            [paired[:, i] for i in range(self.n_fingers) if i != self.thumb_idx], dim=-1
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Args: x (B, F, 3) normalized human fingertips, SAME-FRAME (paired)
+        across the finger dimension -- required for the thumb sub-net's
+        context to be meaningful. Returns: (B, F, 3)."""
+        if x.dim() != 3 or x.shape[1] != self.n_fingers or x.shape[2] != 3:
+            raise ValueError(
+                f"expected (B, {self.n_fingers}, 3) input, got {tuple(x.shape)}"
+            )
+        context = self.context_from_paired(x)
+        outs = []
+        for i in range(self.n_fingers):
+            if i == self.thumb_idx:
+                outs.append(self.nets[i](torch.cat([x[:, i], context], dim=-1)))
+            else:
+                outs.append(self.nets[i](x[:, i]))
+        return torch.stack(outs, dim=1)
+
+    def forward_finger(
+        self, x: torch.Tensor, finger: int, context: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Map a single finger. Args: x (B, 3) -> (B, 3).
+
+        `context`: required for the thumb (finger == thumb_idx) to use the
+        other fingers' positions -- (B, 3*(F-1)), same frame as x. Falls back
+        to a zero placeholder broadcast to batch size if omitted.
+        """
+        if finger == self.thumb_idx:
+            if context is None:
+                context = self.context_placeholder.unsqueeze(0).expand(x.shape[0], -1)
+            return self.nets[finger](torch.cat([x, context], dim=-1))
+        return self.nets[finger](x)
+
+
 class ContactClassifier(nn.Module):
     """f_c: thumb-vs-finger contact score in [0, 1], one sub-net per non-thumb finger.
 

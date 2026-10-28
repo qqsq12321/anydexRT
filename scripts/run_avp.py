@@ -196,6 +196,8 @@ def run_hand(hand: str, args) -> dict:
             hand=hand, epochs=args.epochs if weights is not None else 0, seed=0,
             weights=weights or CONDITIONS["full"],
             use_anchors=(name == "full"),
+            mapper_type="finger",  # this is the paper's own ablation ladder -- pin the
+                                   # paper-faithful architecture regardless of TrainConfig's default
         )
         result = train(samples, clouds, anchors, cfg, raw_fingertips=h_train,
                        train_classifier=(name == "full"),
@@ -234,7 +236,8 @@ def run_hand(hand: str, args) -> dict:
     outs = [full_mapped]
     test_all = np.concatenate(h_test)
     for seed in range(1, args.seeds):
-        cfg = TrainConfig(hand=hand, epochs=args.epochs, seed=seed, weights=CONDITIONS["full"])
+        cfg = TrainConfig(hand=hand, epochs=args.epochs, seed=seed, weights=CONDITIONS["full"],
+                          mapper_type="finger")
         result = train(samples, clouds, anchors, cfg, raw_fingertips=h_train, train_classifier=False)
         rt = AnyDexRT(result.mapper, clouds, kin, samples.normalizer)
         outs.append(np.stack([clouds.normalizer.inverse(rt.map_fingertips(h)) for h in test_all]))

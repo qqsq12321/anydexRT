@@ -29,7 +29,7 @@ from .anchors import AnchorSet
 from .data import HandSamples, RobotClouds
 from .frames import quat_wxyz_to_matrix
 from .losses import LossWeights, contact_loss, mapping_loss
-from .models import ContactClassifier, FingerMapper
+from .models import ContactClassifier, CrossFingerMapper, FingerMapper
 
 
 @dataclass
@@ -94,6 +94,17 @@ class TrainConfig:
     # stays available for the calibration experiments. See README.
     use_local_frames: bool = False
     strategy: str = "synthetic"
+    # 'cross_finger' (default) is CrossFingerMapper: the thumb sub-net also
+    # sees the other fingers' same-frame positions, which a continuous
+    # pinch_mode at inference relies on for a sensible response (see
+    # AnyDexRT.refine_pinch_continuous). 'finger' is the paper-faithful
+    # FingerMapper (strict per-finger factorization) -- scripts reproducing
+    # the paper's own ablation ladder (run_avp.py, run_ladder.py,
+    # validate_chamfer_collapse.py) pin this explicitly rather than relying on
+    # the default, since their whole point is measuring FingerMapper. See
+    # `anydexrt/models.py`.
+    mapper_type: str = "cross_finger"
+    thumb_idx: int = 0
 
     def loss_weights(self) -> LossWeights:
         return LossWeights(**self.weights)
@@ -261,7 +272,8 @@ def train_mapper(
             idx = perm[start : start + config.batch_size]
             if idx.numel() < 2:
                 continue
-            batch = human[idx].permute(1, 0, 2).contiguous()  # (F, N, 3)
+            batch_paired = human[idx]  # (N, F, 3), same-frame across fingers
+            batch = batch_paired.permute(1, 0, 2).contiguous()  # (F, N, 3)
 
             # A short sub-batch of anchors is fed alongside each step, per the
             # paper's "anchor batch size of 32".
@@ -284,6 +296,7 @@ def train_mapper(
                 anchors=anchors_arg,
                 jitter_base=config.jitter_base,
                 jitter_rand=config.jitter_rand,
+                human_paired=batch_paired if config.mapper_type == "cross_finger" else None,
             )
             opt.zero_grad()
             total.backward()
@@ -315,6 +328,8 @@ def train(
     checkpoint_interval: int | None = None,
     checkpoint_dir: str | Path | None = None,
     init_mapper_state: dict | None = None,
+    mapper_type: str | None = None,
+    thumb_idx: int | None = None,
 ) -> TrainResult:
     """Train both networks. They are independent, so order does not matter.
 
@@ -324,20 +339,38 @@ def train(
         init_mapper_state: if given, FingerMapper starts from this state_dict instead
             of random init (warm start / fine-tuning from an existing bundle). Must
             match (n_fingers, width, depth, activation, output_tanh) in config.
+        mapper_type: 'cross_finger' (default) or 'finger'; overrides config.mapper_type
+            if given. See TrainConfig.mapper_type.
+        thumb_idx: thumb's index in the finger axis, for 'cross_finger'; overrides
+            config.thumb_idx if given.
     """
     device = torch.device(device)
     generator = torch.Generator(device=device).manual_seed(config.seed)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
+    mapper_type = config.mapper_type if mapper_type is None else mapper_type
+    thumb_idx = config.thumb_idx if thumb_idx is None else thumb_idx
     F = samples.n_fingers
-    mapper = FingerMapper(
-        n_fingers=F,
-        width=config.width,
-        depth=config.depth,
-        activation=config.activation,
-        output_tanh=config.output_tanh,
-    ).to(device)
+    if mapper_type == "cross_finger":
+        mapper = CrossFingerMapper(
+            n_fingers=F,
+            thumb_idx=thumb_idx,
+            width=config.width,
+            depth=config.depth,
+            activation=config.activation,
+            output_tanh=config.output_tanh,
+        ).to(device)
+    elif mapper_type == "finger":
+        mapper = FingerMapper(
+            n_fingers=F,
+            width=config.width,
+            depth=config.depth,
+            activation=config.activation,
+            output_tanh=config.output_tanh,
+        ).to(device)
+    else:
+        raise ValueError(f"mapper_type must be 'finger' or 'cross_finger', got {mapper_type!r}")
     if init_mapper_state is not None:
         mapper.load_state_dict(init_mapper_state)
         if log_fn:

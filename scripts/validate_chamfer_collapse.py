@@ -140,6 +140,9 @@ def run_condition(
         hand=hand,
         epochs=epochs,
         seed=seed,
+        mapper_type="finger",  # this validates the paper's own chamfer-collapse ablation
+                               # point -- pin the paper-faithful architecture regardless
+                               # of TrainConfig's default
         weights={
             "p_chamfer": weights.p_chamfer,
             "dist": weights.dist,
