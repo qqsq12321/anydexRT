@@ -495,12 +495,13 @@ calibrated against the physical hand by GEORT rather than derived from the URDF:
 
 - **Offsets.** The four finger MCP pitches are shifted −0.152 rad (−8.7°):
   simulation zero is not the hand's zero. The thumb CMC roll offset
-  (`--l20-thumb-roll-offset`) is **off by default**, where the original driver
-  had 0.15 — that pinned qpos=0 to the alignment curve's left point, i.e. the
-  hard stop. Off keeps the thumb further out through the usable range (register
-  220 → 242 at qpos 0.2) but costs the end of travel: qpos 1.39 maps to
-  register 9 rather than 0, so if the thumb cannot close far enough to complete
-  a pinch, raise it to ~0.05. Only a physical hand settles this.
+  (`--l20-thumb-roll-offset`) defaults to **0.075**, half the original driver's
+  0.15 — that pinned qpos=0 to the alignment curve's left point, i.e. the hard
+  stop. 0.075 is where the two ends stop fighting: more abduction than the
+  original (register 226 vs 210 at qpos 0.2) while qpos 1.39 still reaches
+  register 0, so the thumb can close fully. Switching it off entirely gains
+  another 16 counts of abduction but leaves qpos 1.39 at register 9 — the thumb
+  then cannot quite meet for a pinch. Only a physical hand settles this.
 - **A piecewise curve** for three thumb joints, measured at three points each.
   It differs from linear limit normalization by up to 0.10 of full scale (~26
   counts) — e.g. thumb CMC roll at qpos 0, thumb MCP at 0.3 — so it is used

@@ -329,28 +329,31 @@ def test_thumb_roll_offset_is_tunable(names, limits):
         assert regs[off][1:] == regs[0.15][1:], "offset touched another joint"
 
 
-def test_thumb_roll_offset_defaults_off(names, limits):
-    """Off by default; 0.15 (the original driver) pinned qpos=0 to the stop.
+def test_default_thumb_roll_offset_keeps_both_ends(names, limits):
+    """Default 0.075 buys abduction without giving up full adduction.
 
-    Also pins the trade-off that comes with switching it off, so it cannot
-    regress silently: the thumb sits further out through the usable range but
-    no longer reaches the end of travel.
+    Both halves are pinned, since they pull against each other: a larger
+    offset loses abduction, and 0 loses the end of travel (qpos 1.39 stops
+    reaching register 0, so the thumb cannot quite close for a pinch).
     """
     from anydexrt.real_l20 import _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD as default
 
-    assert default == 0.0
-    sim, cmd = zip(*_QPOS_ALIGNMENT_POINTS["THUMB_CMC_ROLL"])
-    assert float(np.interp(0.0 + 0.15, sim, cmd)) < 0.02   # old: already at the stop
-    assert float(np.interp(0.0 + default, sim, cmd)) == 0.0
-
+    assert default == pytest.approx(0.075)
     lo, hi = limits
     i = names.index("thumb_cmc_roll")
     out = LinkerL20Output(dry_run=True)
+    original = LinkerL20Output(dry_run=True, thumb_cmc_roll_offset=0.15)
+    off = LinkerL20Output(dry_run=True, thumb_cmc_roll_offset=0.0)
     q = (lo + hi) / 2
 
     q[i] = hi[i]
-    assert out.qpos_to_registers(q, names)[0] > 0, "end of travel unexpectedly reachable"
+    assert out.qpos_to_registers(q, names)[0] == 0, "full adduction no longer reachable"
+    assert off.qpos_to_registers(q, names)[0] > 0, "0 was expected to lose the end of travel"
 
     q[i] = 0.2
-    with_offset = LinkerL20Output(dry_run=True, thumb_cmc_roll_offset=0.15)
-    assert out.qpos_to_registers(q, names)[0] > with_offset.qpos_to_registers(q, names)[0]
+    assert (off.qpos_to_registers(q, names)[0]
+            > out.qpos_to_registers(q, names)[0]
+            > original.qpos_to_registers(q, names)[0])
+
+    sim, cmd = zip(*_QPOS_ALIGNMENT_POINTS["THUMB_CMC_ROLL"])
+    assert float(np.interp(0.0 + 0.15, sim, cmd)) < 0.02   # original: at the stop

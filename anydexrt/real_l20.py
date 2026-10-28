@@ -12,10 +12,9 @@ physical hand by GEORT rather than derived from the URDF:
 
   1. **Offsets** (`_JOINT_OFFSETS_RAD`). The four finger MCP pitches get
      -0.152 rad (-8.7 deg), i.e. simulation zero is not the real hand's zero.
-     The thumb CMC roll offset is tunable and now OFF by default
-     (`thumb_cmc_roll_offset`, was 0.15 in the original driver) because it
-     decides how far out the thumb sits at rest and can only be judged on a
-     physical hand.
+     The thumb CMC roll offset is tunable and defaults to 0.075, half the
+     original driver's 0.15 (`thumb_cmc_roll_offset`), because it decides how
+     far out the thumb sits at rest and can only be judged on a physical hand.
   2. **Piecewise alignment** for the three thumb joints that were measured at
      three points each (`_QPOS_ALIGNMENT_POINTS`). Interpolating through them
      differs from linear limit normalization by up to 0.10 of full scale
@@ -116,17 +115,19 @@ _INVERTED_JOINTS = frozenset({
 # Applied to qpos before normalization (and before the alignment curve, for the
 # joints that have one): simulation zero is not the hand's zero.
 #
-# THUMB_CMC_ROLL is off by default, where the original driver had +0.15. That
-# value pinned qpos=0 to 0.1396 -- the left point of this joint's alignment
-# curve -- so a fully open thumb commanded 0.009, essentially the hard stop.
+# THUMB_CMC_ROLL: half the original driver's 0.15, which pinned qpos=0 to
+# 0.1396 -- the left point of this joint's alignment curve -- so a fully open
+# thumb commanded 0.009, essentially the hard stop.
 #
-# The trade, which only a physical hand settles: with no offset the thumb sits
-# further out through the usable range (register 220 -> 242 at qpos 0.2) but no
-# longer reaches the end of travel, since qpos 1.39 now maps to register 9
-# rather than 0. If the thumb cannot close far enough to complete a pinch, that
-# is this. Raise it per run with LinkerL20Output(thumb_cmc_roll_offset=...),
-# i.e. `teleop_avp.py --l20-thumb-roll-offset 0.05`.
-_DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.0
+# 0.075 is where the two ends stop fighting: the thumb sits further out through
+# the usable range than the original (register 226 vs 210 at qpos 0.2) while
+# qpos 1.39 still maps to register 0, so full adduction remains reachable.
+# Turning the offset off entirely gains another 16 counts of abduction but
+# leaves qpos 1.39 at register 9 -- the thumb then cannot quite close, which
+# shows up as a pinch that will not meet. Override per run with
+# LinkerL20Output(thumb_cmc_roll_offset=...), i.e.
+# `teleop_avp.py --l20-thumb-roll-offset`.
+_DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.075
 
 _JOINT_OFFSETS_RAD = {
     "THUMB_CMC_ROLL": _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
