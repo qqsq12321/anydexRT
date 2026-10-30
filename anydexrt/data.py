@@ -13,7 +13,10 @@ finger i is generated with the other fingers at neutral.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,6 +25,130 @@ import numpy as np
 from .hands import HandSpec, get_hand
 from .kinematics import HandKinematics
 from .normalize import HandNormalizer
+
+# ------------------------------------------------------------- disk cache
+#
+# Sampling the robot cloud is the slowest part of starting up: 20000 forward
+# kinematics evaluations in MuJoCo (3.6s measured) plus 0.7s for the fingertip
+# orientations. `load_bundle` pays it every time, because a bundle stores only
+# `cloud_samples` and `cloud_seed` and rebuilds the cloud from them -- so
+# `teleop_avp.py` took ~7s to reach the viewer.
+#
+# The cloud is a pure function of (hand spec, n_samples, seed, MJCF), so it can
+# be cached. The key covers all four, with the MJCF hashed by CONTENT (and
+# recursively through its `<include>`s) rather than by path or mtime: editing a
+# model must invalidate the cache. A stale cloud is exactly the kind of silent
+# defect this project has hit repeatedly -- the mapper and `load_bundle`'s
+# cloud have to agree, and nothing else checks that they do.
+#
+# Normalization is deliberately not cached (5ms), and neither is the palm-frame
+# transform: entries hold world-frame arrays, so one serves both
+# `frame="world"` and `frame="palm"`.
+#
+# ANYDEXRT_NO_CACHE=1 disables caching; ANYDEXRT_CACHE_DIR relocates it.
+_CACHE_VERSION = 1
+
+
+def cache_dir(subdir: str) -> Path | None:
+    """Where derived-artifact caches live, or None if caching is off."""
+    if os.environ.get("ANYDEXRT_NO_CACHE"):
+        return None
+    override = os.environ.get("ANYDEXRT_CACHE_DIR")
+    if override:
+        return Path(override) / subdir
+    base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
+    return Path(base) / "anydexrt" / subdir
+
+
+def cache_load(key: str, subdir: str) -> dict[str, np.ndarray] | None:
+    """Read one entry's arrays, or None if absent, disabled or unreadable."""
+    directory = cache_dir(subdir)
+    if directory is None:
+        return None
+    path = directory / f"{key}.npz"
+    if not path.exists():
+        return None
+    try:
+        with np.load(path) as payload:
+            return {name: payload[name] for name in payload.files}
+    except Exception:
+        # Truncated or unreadable: recompute, and let the store overwrite it.
+        return None
+
+
+def cache_store(key: str, subdir: str, **arrays: np.ndarray) -> bool:
+    """Write one entry. Returns whether it landed; tests assert on this.
+
+    Failures are swallowed -- a cache is an optimization and must never break a
+    run -- but the return value exists so a silent failure cannot go unnoticed
+    the way the first version's did: `np.savez` appends `.npz` to a name that
+    lacks it, so the temp file was written to one path and renamed from
+    another, and every store failed invisibly while the cache looked enabled.
+    """
+    directory = cache_dir(subdir)
+    if directory is None:
+        return False
+    path = directory / f"{key}.npz"
+    # Keep `.npz` on the temp name too, or np.savez appends its own.
+    temp = directory / f"{key}.{os.getpid()}.tmp.npz"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        # Write-then-rename: a process killed mid-write cannot leave a partial
+        # file that a later run would read as valid.
+        np.savez(temp, **arrays)
+        os.replace(temp, path)
+        return True
+    except Exception:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def content_hash(*parts: bytes | str) -> str:
+    """Stable short digest over byte/str parts, for cache keys."""
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode() if isinstance(part, str) else part)
+        digest.update(b"\x00")
+    return digest.hexdigest()[:32]
+
+
+def mjcf_fingerprint(path: str | Path) -> str:
+    """sha256 over an MJCF and every file it `<include>`s, recursively.
+
+    Mesh assets are not hashed: fingertip FK depends on the body/joint tree and
+    on `FingerSpec.tip_offset`, not on mesh geometry.
+    """
+    digest = hashlib.sha256()
+    seen: set[Path] = set()
+    queue = [Path(path)]
+    while queue:
+        current = queue.pop(0)
+        try:
+            resolved = current.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            data = resolved.read_bytes()
+        except OSError:
+            # Missing include: fold its name in, as there is no content to
+            # hash and the key still has to change if it appears later.
+            digest.update(f"<missing:{current.name}>".encode())
+            continue
+        # Content only, deliberately not the filename: `asset_root` is
+        # overridable, so the same model legitimately lives at different paths,
+        # and hashing the name would miss the cache on a move for no reason.
+        # Hand identity is already covered by `repr(hand_spec)` in the key, and
+        # an `<include>`'s filename is part of its parent's bytes.
+        digest.update(data)
+        for match in re.finditer(rb'<include\s+file\s*=\s*"([^"]+)"', data):
+            queue.append(resolved.parent / match.group(1).decode())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -189,9 +316,25 @@ def build_robot_clouds(
         raise ValueError(f"frame must be 'world' or 'palm', got {frame!r}")
     hand_spec = get_hand(hand) if isinstance(hand, str) else hand
     kin = HandKinematics(hand_spec, asset_root=asset_root)
-    rng = np.random.default_rng(seed)
-    qpos, tips = kin.sample_fingertip_cloud(n_samples, rng)
-    tips_rot = fingertip_orientations(kin, qpos)
+
+    # Cached on (hand spec, n_samples, seed, MJCF content) -- see the cache
+    # comment at the top of this module. Entries are world-frame, so the palm
+    # transform and the normalization below apply to a hit identically.
+    key = content_hash(
+        f"v{_CACHE_VERSION}",
+        repr(hand_spec),  # frozen dataclass: fingers, couplings, tip offsets
+        str(int(n_samples)),
+        str(int(seed)),
+        mjcf_fingerprint(hand_spec.resolved_mjcf(asset_root)),
+    )
+    cached = cache_load(key, "clouds")
+    if cached is not None:
+        qpos, tips, tips_rot = cached["qpos"], cached["tips"], cached["tips_rot"]
+    else:
+        rng = np.random.default_rng(seed)
+        qpos, tips = kin.sample_fingertip_cloud(n_samples, rng)
+        tips_rot = fingertip_orientations(kin, qpos)
+        cache_store(key, "clouds", qpos=qpos, tips=tips, tips_rot=tips_rot)
 
     origin = np.zeros(3)
     rot = np.eye(3)
