@@ -12,7 +12,8 @@ physical hand by GEORT rather than derived from the URDF:
 
   1. **Offsets** (`_JOINT_OFFSETS_RAD`). The index, ring and pinky MCP pitches
      get -0.152 rad (-8.7 deg), i.e. simulation zero is not the real hand's
-     zero; MIDDLE_MCP_PITCH uses half that, -0.077 (see the constant).
+     zero; the middle finger is hand-tuned differently (MCP pitch -0.08, plus
+     the only PIP offset, -0.12 -- see the constant).
      The thumb CMC roll offset is tunable and defaults to 0.075, half the
      original driver's 0.15 (`thumb_cmc_roll_offset`), because it decides how
      far out the thumb sits at rest and can only be judged on a physical hand.
@@ -130,22 +131,32 @@ _INVERTED_JOINTS = frozenset({
 # `teleop_avp.py --l20-thumb-roll-offset`.
 _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.075
 
-# MIDDLE_MCP_PITCH is half the -0.152 the other three fingers use, which
-# compensates in the right direction: a less negative offset bends the finger
-# MORE (register 255 is fully extended), and the retargeter under-flexes this
-# joint -- median qpos 0.319 against the index finger's 0.644 on a PICO
-# recording, with the PIPs about equal, so the shortfall is at the MCP.
+# The middle finger's two values were tuned on the physical hand and are the
+# only ones that differ from GEORT's: MCP pitch -0.08 (less negative than the
+# other three fingers, so it flexes more) and PIP -0.12 (the only PIP offset
+# at all; the other three PIPs stay at 0).
 #
-# This is a real-hand correction for a mapping asymmetry, not a fix for it;
-# -0.7 was tried first and went the wrong way, pinning 63% of frames at full
-# extension. Override per run with
+# Direction: the offset is added to qpos before normalization and register 255
+# is full extension, so MORE negative extends and closer to 0 flexes. Measured
+# on the 2553-frame PICO recording, middle MCP pitch register (median /
+# most-flexed / share pinned at full extension):
+#
+#   -0.080   205 /  18 / 31%     (here)
+#   -0.152   220 /  33 / 38%     (the other three fingers)
+#   -0.200   230 /  43 / 43%
+#   -0.300   251 /  64 / 50%
+#
+# Going more negative costs flexion range -- at -0.3 the joint bottoms out at
+# register 64 instead of 18 -- which is the trade -0.7 lost outright, pinning
+# 63% of frames at full extension. Override per run with
 # `teleop_avp.py --l20-joint-offset MIDDLE_MCP_PITCH=<rad>`.
 _JOINT_OFFSETS_RAD = {
     "THUMB_CMC_ROLL": _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
     "INDEX_MCP_PITCH": -0.15235988,
-    "MIDDLE_MCP_PITCH": -0.077,
+    "MIDDLE_MCP_PITCH": -0.08,
     "RING_MCP_PITCH": -0.15235988,
     "PINKY_MCP_PITCH": -0.15235988,
+    "MIDDLE_PIP": -0.12,
 }
 
 # Measured (simulation qpos -> normalized command) pairs for the thumb joints
