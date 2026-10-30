@@ -10,8 +10,9 @@ The mapping is NOT "send qpos as-is". Three things sit between a simulation
 joint value and the byte the hand receives, all of them measured against the
 physical hand by GEORT rather than derived from the URDF:
 
-  1. **Offsets** (`_JOINT_OFFSETS_RAD`). The four finger MCP pitches get
-     -0.152 rad (-8.7 deg), i.e. simulation zero is not the real hand's zero.
+  1. **Offsets** (`_JOINT_OFFSETS_RAD`). The index, ring and pinky MCP pitches
+     get -0.152 rad (-8.7 deg), i.e. simulation zero is not the real hand's
+     zero; MIDDLE_MCP_PITCH is currently -0.7 (under test, see the constant).
      The thumb CMC roll offset is tunable and defaults to 0.075, half the
      original driver's 0.15 (`thumb_cmc_roll_offset`), because it decides how
      far out the thumb sits at rest and can only be judged on a physical hand.
@@ -129,10 +130,18 @@ _INVERTED_JOINTS = frozenset({
 # `teleop_avp.py --l20-thumb-roll-offset`.
 _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.075
 
+# MIDDLE_MCP_PITCH is being tried at -0.7 against a physical hand, where the
+# other three fingers keep GEORT's -0.152. Note what the magnitude costs: an
+# offset shifts the whole qpos->register line, so -0.7 saturates qpos 0..0.57
+# at register 255 (the middle finger does not move over the first half of the
+# human finger's travel) and caps flexion at 146 instead of 32, leaving 43% of
+# the range usable against -0.152's 87%. Revert to -0.15235988 to match the
+# other fingers, or override per run with
+# `teleop_avp.py --l20-joint-offset MIDDLE_MCP_PITCH=<rad>`.
 _JOINT_OFFSETS_RAD = {
     "THUMB_CMC_ROLL": _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
     "INDEX_MCP_PITCH": -0.15235988,
-    "MIDDLE_MCP_PITCH": -0.15235988,
+    "MIDDLE_MCP_PITCH": -0.7,
     "RING_MCP_PITCH": -0.15235988,
     "PINKY_MCP_PITCH": -0.15235988,
 }

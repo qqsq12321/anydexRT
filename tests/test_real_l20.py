@@ -360,18 +360,22 @@ def test_default_thumb_roll_offset_keeps_both_ends(names, limits):
 
 
 def test_finger_pitch_offset_applies_to_all_four(names, limits):
+    """One value for all four, overriding whatever per-finger defaults exist."""
     lo, hi = limits
     q = (lo + hi) / 2
     for f in ("index", "middle", "ring", "pinky"):
         q[names.index(f"{f}_mcp_pitch")] = 0.5
 
-    default = LinkerL20Output(dry_run=True).qpos_to_registers(q, names)
+    baseline = LinkerL20Output(
+        dry_run=True, finger_mcp_pitch_offset=-0.152
+    ).qpos_to_registers(q, names)
     shifted = LinkerL20Output(
         dry_run=True, finger_mcp_pitch_offset=-0.7
     ).qpos_to_registers(q, names)
     # root1 block, entries 1..4 are the four finger MCP pitches
-    assert all(shifted[c] > default[c] for c in range(11, 15))
-    assert shifted[:11] == default[:11]
+    assert all(shifted[c] > baseline[c] for c in range(11, 15))
+    assert len(set(shifted[11:15])) == 1, "all four should share the one value"
+    assert shifted[:11] == baseline[:11]
 
 
 def test_single_joint_offset_leaves_the_others_alone(names, limits):
@@ -380,13 +384,18 @@ def test_single_joint_offset_leaves_the_others_alone(names, limits):
     for f in ("index", "middle", "ring", "pinky"):
         q[names.index(f"{f}_mcp_pitch")] = 0.5
 
-    default = LinkerL20Output(dry_run=True).qpos_to_registers(q, names)
+    # Pin all four first, so this isolates the single-joint override rather
+    # than whichever per-finger defaults happen to be in place.
+    even = LinkerL20Output(dry_run=True, finger_mcp_pitch_offset=-0.152)
     one = LinkerL20Output(
-        dry_run=True, joint_offsets={"MIDDLE_MCP_PITCH": -0.7}
-    ).qpos_to_registers(q, names)
-    assert one[12] > default[12]                       # middle moved
-    assert one[:12] == default[:12]                    # index and before did not
-    assert one[13:] == default[13:]                    # ring, pinky, distal did not
+        dry_run=True, finger_mcp_pitch_offset=-0.152,
+        joint_offsets={"MIDDLE_MCP_PITCH": -0.7},
+    )
+    base = even.qpos_to_registers(q, names)
+    got = one.qpos_to_registers(q, names)
+    assert got[12] > base[12]                          # middle moved
+    assert got[:12] == base[:12]                       # index and before did not
+    assert got[13:] == base[13:]                       # ring, pinky, distal did not
 
 
 def test_large_offset_clips_travel(names, limits):
@@ -399,6 +408,7 @@ def test_large_offset_clips_travel(names, limits):
     i = names.index("middle_mcp_pitch")
     out = LinkerL20Output(dry_run=True, joint_offsets={"MIDDLE_MCP_PITCH": -0.7})
     q = (lo + hi) / 2
+
 
     at = {}
     for v in (0.0, 0.57, hi[i]):
