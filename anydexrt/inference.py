@@ -241,6 +241,8 @@ class AnyDexRT:
         fist_thumb_extended_mm: float = 125.0,
         fist_thumb_bent: float = 0.92,
         fist_thumb_straight: float = 0.95,
+        pinch_thumb_combine: int = 2,
+        pinch_thumb_sharpness: float = 3.0,
         fist_open_reach_mm: float = 110.0,
         fist_curled_reach_mm: float = 80.0,
     ):
@@ -322,6 +324,9 @@ class AnyDexRT:
         self.fist_thumb_extended = fist_thumb_extended_mm / 1000.0
         self.fist_thumb_bent = fist_thumb_bent
         self.fist_thumb_straight = fist_thumb_straight
+        self.pinch_thumb_combine = max(1, int(pinch_thumb_combine))
+        self.pinch_thumb_sharpness = float(pinch_thumb_sharpness)
+        self.last_pinch: dict | None = None
         self.fist_open_reach = fist_open_reach_mm / 1000.0
         self.fist_curled_reach = fist_curled_reach_mm / 1000.0
         self.last_fist: dict | None = None
@@ -511,18 +516,58 @@ class AnyDexRT:
                 nearest_k[finger] = templates.nearest(mapped[0], mapped[finger])
 
         active = {f: a for f, a in alphas.items() if a > 0.0}
+        self.last_pinch = None
         if not active:
             return out
-        dominant = max(active, key=active.get)
-
+        # Every finger blends its OWN slice with its own alpha: a finger does
+        # not care what the thumb is doing.
         for finger, alpha in active.items():
             templates = self.pinch_templates[finger]
-            k = nearest_k[finger]
             finger_sl = self.kin.hand.joint_slice(self.kin.hand.fingers[finger].name)
-            out[finger_sl] = (1 - alpha) * out[finger_sl] + alpha * templates.finger_q[k]
-            if finger == dominant:
-                thumb_sl = self.kin.hand.joint_slice(self.kin.hand.fingers[0].name)
-                out[thumb_sl] = (1 - alpha) * out[thumb_sl] + alpha * templates.thumb_q[k]
+            out[finger_sl] = (
+                (1 - alpha) * out[finger_sl] + alpha * templates.finger_q[nearest_k[finger]]
+            )
+
+        # The thumb is shared, so it gets one blend built from the strongest
+        # `pinch_thumb_combine` fingers rather than from the single dominant
+        # one. Moving between two pinches, the human thumb is briefly far from
+        # both fingers, so both alphas sag (measured: the max drops to ~0.43
+        # mid-transition) and a max-weighted blend hands most of the weight
+        # back to f_m's raw thumb pose -- whose roll sits at 0.057 rad against
+        # the calibrated pinch poses' 0.60-1.19, i.e. almost fully abducted.
+        # The thumb therefore swung outward between every pair of fingers
+        # (measured over 45 transitions: it left the two calibrated values'
+        # range every single time, by 17 deg on average and up to 24 deg).
+        #
+        # Two parts fix it. The TARGET is an alpha^p weighted average of the
+        # calibrated thumb poses, so a transition interpolates along the
+        # calibrated arc instead of detouring through f_m's pose. The WEIGHT is
+        # the sum of those alphas, clamped, so two half-engaged fingers keep
+        # the thumb on the arc rather than releasing it.
+        #
+        # This is not the earlier defect the docstring above describes (the
+        # thumb slice being overwritten once per active finger): that applied
+        # each finger's alpha in sequence, so a weak partial pinch could undo
+        # a strong one. Here there is a single blend, and p=3 keeps a genuine
+        # single-finger pinch dominant -- alphas of 1.0 and 0.4 give the
+        # leader 94% of the target.
+        ranked = sorted(active.items(), key=lambda kv: -kv[1])[: self.pinch_thumb_combine]
+        weights = np.array([a ** self.pinch_thumb_sharpness for _, a in ranked])
+        total = float(weights.sum())
+        thumb_sl = self.kin.hand.joint_slice(self.kin.hand.fingers[0].name)
+        if total <= 0.0:
+            return out
+        weights = weights / total
+        target = np.zeros(thumb_sl.stop - thumb_sl.start, dtype=out.dtype)
+        for (finger, _), w in zip(ranked, weights):
+            target += w * self.pinch_templates[finger].thumb_q[nearest_k[finger]]
+        thumb_alpha = float(min(sum(a for _, a in ranked), 1.0))
+        out[thumb_sl] = (1 - thumb_alpha) * out[thumb_sl] + thumb_alpha * target
+        self.last_pinch = {
+            "alphas": dict(alphas),
+            "thumb_alpha": thumb_alpha,
+            "leaders": [self.kin.hand.finger_names[f] for f, _ in ranked],
+        }
         return out
 
     def refine_fist(
@@ -751,6 +796,7 @@ def load_bundle(
     fist_thumb_rest_mm: float = 110.0, fist_thumb_extended_mm: float = 125.0,
     fist_thumb_bent: float = 0.92, fist_thumb_straight: float = 0.95,
     fist_open_reach_mm: float = 110.0,
+    pinch_thumb_combine: int = 2, pinch_thumb_sharpness: float = 3.0,
 ) -> AnyDexRT:
     """Rebuild a ready-to-run AnyDexRT from `save_bundle` output."""
     from .data import build_robot_clouds
@@ -788,4 +834,6 @@ def load_bundle(
         fist_thumb_rest_mm=fist_thumb_rest_mm, fist_thumb_extended_mm=fist_thumb_extended_mm,
         fist_thumb_bent=fist_thumb_bent, fist_thumb_straight=fist_thumb_straight,
         fist_open_reach_mm=fist_open_reach_mm,
+        pinch_thumb_combine=pinch_thumb_combine,
+        pinch_thumb_sharpness=pinch_thumb_sharpness,
     )
