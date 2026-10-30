@@ -330,7 +330,7 @@ def test_thumb_roll_offset_is_tunable(names, limits):
 
 
 def test_default_thumb_roll_offset_keeps_both_ends(names, limits):
-    """Default 0.075 buys abduction without giving up full adduction.
+    """Default 0.05 buys abduction without giving up full adduction.
 
     Both halves are pinned, since they pull against each other: a larger
     offset loses abduction, and 0 loses the end of travel (qpos 1.39 stops
@@ -338,7 +338,7 @@ def test_default_thumb_roll_offset_keeps_both_ends(names, limits):
     """
     from anydexrt.real_l20 import _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD as default
 
-    assert default == pytest.approx(0.075)
+    assert default == pytest.approx(0.05)
     lo, hi = limits
     i = names.index("thumb_cmc_roll")
     out = LinkerL20Output(dry_run=True)

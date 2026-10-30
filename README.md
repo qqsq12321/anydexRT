@@ -57,7 +57,7 @@ unrelated to the method.
 conda activate anydex          # mujoco + torch + numpy + scipy
 export PYTHONPATH=/home/qsq/qqsq12321/anydexRT
 
-pytest tests/ -q                                   # 143 unit tests
+pytest tests/ -q                                   # 159 unit tests
 python scripts/validate_chamfer_collapse.py        # rung 1 alone
 python scripts/run_ladder.py --epochs 60           # the full ladder
 ```
@@ -421,6 +421,35 @@ Both entry points rebuild the palm frame from each live frame's own skeleton, so
 no stored calibration is needed. Drives are in `rt.kin.hand.joint_names` order;
 coupled joints (L20 DIP/IP) follow via `rt.kin.hand.drive_targets`.
 
+### The thumb between two pinches
+
+Moving from one pinch to the next, the thumb used to swing outward before
+arriving — on a PICO recording it left the two calibrated poses' range on
+**all 45** finger-to-finger transitions, by 20° on average and up to 46°.
+
+The cause is in how the blend weight is defined. `alpha` comes from the real
+thumb-to-finger gap, so mid-transition the thumb is far from both fingers and
+both alphas sag (the max drops to ~0.43). Weighted by the single dominant
+finger, that hands most of the weight back to `f_m`'s raw thumb pose, whose
+roll sits at 0.057 rad against the calibrated pinches' 0.60–1.19 — nearly full
+abduction. The thumb was being released, not moved.
+
+Two changes (`pinch_thumb_combine=2`, `pinch_thumb_sharpness=3`): the thumb
+target is now an `alpha^3`-weighted average over the two strongest fingers'
+calibrated poses, so a transition interpolates along the calibrated arc, and
+the thumb's blend weight is their **sum** rather than the max, so two
+half-engaged fingers still hold it there. Transitions that leave the range
+drop to 67 %, average excursion to 13°. Single-finger pinch is unaffected
+(index 7 mm, middle 9 mm) and ring improved 13 → 8 mm; `p=3` keeps a genuine
+leader at 94 % of the target, so this is not the earlier defect where a weak
+partial pinch overwrote a strong one.
+
+The remaining third is a different mechanism: on 16 of 45 transitions the two
+alphas sum below 0.5 because the operator's thumb genuinely leaves both
+fingers (both gaps exceed `open_gap`), so no pinch is engaged and the thumb
+returns to `f_m`'s pose by definition. Fixing that needs a hold/decay, which
+would make a deliberate hand-opening sticky, so it is not done here.
+
 ### Two kept bundles, one per capture device
 
 `scripts/train_bundle.py` trains one deployable CrossFingerMapper bundle from a
@@ -452,6 +481,16 @@ python scripts/teleop_avp.py --hand linker_l20 --input avp --avp-ip <headset-ip>
 python scripts/teleop_avp.py --hand linker_l20 --input pico4 \
   --bundle results/pico4/linker_l20_C_cross_finger_bundle.pt --pinch-mode continuous
 ```
+
+Startup caches the sampled robot cloud under `~/.cache/anydexrt` (5.9 MB per
+entry), because a bundle stores only `cloud_samples` and `cloud_seed` and
+`load_bundle` otherwise re-runs 20000 MuJoCo forward-kinematics evaluations
+every time: 7.0 s to reach the viewer, against 2.8 s on a hit. The key covers
+the hand spec, sample count, seed and the MJCF's **content** (recursively
+through its `<include>`s) — a model edit has to invalidate it, since a stale
+cloud puts the mapper and inference in different spaces, which is the silent
+failure mode of errata 4. `ANYDEXRT_NO_CACHE=1` disables it;
+`ANYDEXRT_CACHE_DIR` relocates it.
 
 `--input` also picks the pinch gate (`PINCH_MIN_EXTENSION_MM`: 110 mm for AVP,
 90 mm for PICO 4). PICO measures the same hand as reaching 20–35 mm less far, so
@@ -501,13 +540,13 @@ calibrated against the physical hand by GEORT rather than derived from the URDF:
   one end. −0.152 keeps 87 % of the range usable (register 255 → 32 across the
   joint limits); −0.7 leaves 43 % and flattens qpos 0…0.57 onto 255, i.e. the
   finger barely curls. The thumb CMC roll offset
-  (`--l20-thumb-roll-offset`) defaults to **0.075**, half the original driver's
-  0.15 — that pinned qpos=0 to the alignment curve's left point, i.e. the hard
-  stop. 0.075 is where the two ends stop fighting: more abduction than the
-  original (register 226 vs 210 at qpos 0.2) while qpos 1.39 still reaches
-  register 0, so the thumb can close fully. Switching it off entirely gains
-  another 16 counts of abduction but leaves qpos 1.39 at register 9 — the thumb
-  then cannot quite meet for a pinch. Only a physical hand settles this.
+  (`--l20-thumb-roll-offset`) defaults to **0.05**, a third of the original
+  driver's 0.15 — that pinned qpos=0 to the alignment curve's left point, i.e.
+  the hard stop. 0.05 is the floor that still keeps both ends: the smallest
+  value for which qpos 1.39 reaches register 0, so the thumb can close fully
+  (0.04 leaves 2 counts short, 0 leaves 9 — enough that a pinch stops meeting),
+  while giving more abduction through the usable range than the original
+  (register 231 at qpos 0.2 against 210). Only a physical hand settles this.
 - **A piecewise curve** for three thumb joints, measured at three points each.
   It differs from linear limit normalization by up to 0.10 of full scale (~26
   counts) — e.g. thumb CMC roll at qpos 0, thumb MCP at 0.3 — so it is used
@@ -631,8 +670,9 @@ scripts/
   run_ladder.py                  the full ladder
 calibrated_pinch_poses.yaml      output of calibrate_pinch.py (L20)
 calibrated_fist_pose.yaml        output of calibrate_fist.py (L20)
-tests/           143 unit tests (losses, metrics, normalization, frames,
-                 smoothing, AVP, PICO protocol round-trips, L20 registers)
+tests/           159 unit tests (losses, metrics, normalization, frames,
+                 smoothing, AVP, PICO protocol round-trips, L20 registers,
+                 cloud cache invalidation)
 ```
 
 ## Licence note

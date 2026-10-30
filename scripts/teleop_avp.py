@@ -81,7 +81,7 @@ Joint LIMITS need no conversion -- anydexRT's L20 limits equal the driver's
 per-joint (checked before this flag existed) -- but the qpos->register mapping
 is not the identity: it applies GEORT's measured offsets (the four finger MCP
 pitches are shifted -8.7 deg, i.e. simulation zero is not the hand's zero;
-the thumb CMC roll offset is halved, see --l20-thumb-roll-offset),
+the thumb CMC roll offset is lowered, see --l20-thumb-roll-offset),
 a measured piecewise curve for three thumb joints, and per-joint direction
 inversion. See anydexrt/real_l20.py.
 
@@ -312,11 +312,12 @@ def main() -> int:
                          "came up latched after a stall or an e-stop")
     ap.add_argument("--l20-thumb-roll-offset", type=float, default=None,
                     help="qpos offset (rad) added to thumb_cmc_roll before its calibration "
-                         "curve, which sets how far out the thumb sits at rest. Default 0.075, "
-                         "half the original driver's 0.15 (which pinned qpos=0 to the hard stop): "
-                         "more abduction than the original (register 226 vs 210 at qpos 0.2) while "
-                         "full adduction stays reachable. 0 gains 16 more counts of abduction but "
-                         "leaves qpos 1.39 at register 9, so the thumb cannot quite close.")
+                         "curve, which sets how far out the thumb sits at rest. Default 0.05, a "
+                         "third of the original driver's 0.15 (which pinned qpos=0 to the hard "
+                         "stop), and the floor that still keeps both ends: it is the smallest "
+                         "value for which qpos 1.39 reaches register 0, so the thumb can close "
+                         "fully. 0.04 leaves 2 counts short, 0 leaves 9 -- enough that a pinch "
+                         "stops meeting.")
     ap.add_argument("--l20-finger-pitch-offset", type=float, default=None,
                     help="qpos offset (rad) for ALL FOUR finger MCP pitches at once. Default "
                          "-0.152; simulation zero is not the hand's zero. Watch what it costs: "

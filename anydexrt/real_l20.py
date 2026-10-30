@@ -14,7 +14,7 @@ physical hand by GEORT rather than derived from the URDF:
      get -0.152 rad (-8.7 deg), i.e. simulation zero is not the real hand's
      zero; the middle finger is hand-tuned differently (MCP pitch -0.08, plus
      the only PIP offset, -0.12 -- see the constant).
-     The thumb CMC roll offset is tunable and defaults to 0.075, half the
+     The thumb CMC roll offset is tunable and defaults to 0.05, a third of the
      original driver's 0.15 (`thumb_cmc_roll_offset`), because it decides how
      far out the thumb sits at rest and can only be judged on a physical hand.
   2. **Piecewise alignment** for the three thumb joints that were measured at
@@ -117,19 +117,18 @@ _INVERTED_JOINTS = frozenset({
 # Applied to qpos before normalization (and before the alignment curve, for the
 # joints that have one): simulation zero is not the hand's zero.
 #
-# THUMB_CMC_ROLL: half the original driver's 0.15, which pinned qpos=0 to
+# THUMB_CMC_ROLL: a third of the original driver's 0.15, which pinned qpos=0 to
 # 0.1396 -- the left point of this joint's alignment curve -- so a fully open
 # thumb commanded 0.009, essentially the hard stop.
 #
-# 0.075 is where the two ends stop fighting: the thumb sits further out through
-# the usable range than the original (register 226 vs 210 at qpos 0.2) while
-# qpos 1.39 still maps to register 0, so full adduction remains reachable.
-# Turning the offset off entirely gains another 16 counts of abduction but
-# leaves qpos 1.39 at register 9 -- the thumb then cannot quite close, which
-# shows up as a pinch that will not meet. Override per run with
-# LinkerL20Output(thumb_cmc_roll_offset=...), i.e.
+# 0.05 is the floor that still keeps both ends: it is the smallest value for
+# which qpos 1.39 maps to register 0, so the thumb can still close fully. 0.04
+# leaves 2 counts, 0.03 leaves 4, and 0 leaves 9 -- enough that a pinch stops
+# meeting. Going the other way costs abduction through the usable range
+# (register 231 at qpos 0.2, against 226 at 0.075 and the original's 210).
+# Override per run with LinkerL20Output(thumb_cmc_roll_offset=...), i.e.
 # `teleop_avp.py --l20-thumb-roll-offset`.
-_DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.075
+_DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.05
 
 # The middle finger's two values were tuned on the physical hand and are the
 # only ones that differ from GEORT's: MCP pitch -0.08 (less negative than the
