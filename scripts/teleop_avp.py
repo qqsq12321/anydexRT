@@ -317,6 +317,17 @@ def main() -> int:
                          "more abduction than the original (register 226 vs 210 at qpos 0.2) while "
                          "full adduction stays reachable. 0 gains 16 more counts of abduction but "
                          "leaves qpos 1.39 at register 9, so the thumb cannot quite close.")
+    ap.add_argument("--l20-finger-pitch-offset", type=float, default=None,
+                    help="qpos offset (rad) for ALL FOUR finger MCP pitches at once. Default "
+                         "-0.152; simulation zero is not the hand's zero. Watch what it costs: "
+                         "the offset shifts the whole qpos->register line, so a large magnitude "
+                         "clips travel. -0.152 keeps 87%% of the range usable (register 255 -> 32 "
+                         "across the joint limits); -0.7 leaves 43%% and flattens qpos 0..0.57 "
+                         "onto 255, i.e. the finger barely curls.")
+    ap.add_argument("--l20-joint-offset", action="append", default=None, metavar="JOINT=RAD",
+                    help="override ONE joint's offset, e.g. --l20-joint-offset MIDDLE_MCP_PITCH=-0.7 "
+                         "(repeatable). For when one finger needs a different value than the other "
+                         "three; see --l20-finger-pitch-offset for the shared knob.")
     ap.add_argument("--l20-open-on-exit", action="store_true",
                     help="command an open palm before closing the serial port, so the hand "
                          "is not left holding a clenched pose")
@@ -368,6 +379,18 @@ def main() -> int:
     if args.real:
         from anydexrt.real_l20 import LinkerL20Output
 
+        l20_joint_offsets = {}
+        for item in args.l20_joint_offset or []:
+            if "=" not in item:
+                print(f"--l20-joint-offset expects JOINT=RAD, got {item!r}", file=sys.stderr)
+                return 1
+            joint, _, value = item.partition("=")
+            try:
+                l20_joint_offsets[joint.strip()] = float(value)
+            except ValueError:
+                print(f"--l20-joint-offset: {value!r} is not a number", file=sys.stderr)
+                return 1
+
         dry_run = not args.confirm_real
         if dry_run:
             print("--real given WITHOUT --confirm-real: dry run, registers computed and "
@@ -383,6 +406,8 @@ def main() -> int:
             print_registers=dry_run, dry_run=dry_run,
             **({} if args.l20_thumb_roll_offset is None
                else {"thumb_cmc_roll_offset": args.l20_thumb_roll_offset}),
+            finger_mcp_pitch_offset=args.l20_finger_pitch_offset,
+            joint_offsets=l20_joint_offsets,
         )
 
     model = kin.model

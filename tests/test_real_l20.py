@@ -357,3 +357,57 @@ def test_default_thumb_roll_offset_keeps_both_ends(names, limits):
 
     sim, cmd = zip(*_QPOS_ALIGNMENT_POINTS["THUMB_CMC_ROLL"])
     assert float(np.interp(0.0 + 0.15, sim, cmd)) < 0.02   # original: at the stop
+
+
+def test_finger_pitch_offset_applies_to_all_four(names, limits):
+    lo, hi = limits
+    q = (lo + hi) / 2
+    for f in ("index", "middle", "ring", "pinky"):
+        q[names.index(f"{f}_mcp_pitch")] = 0.5
+
+    default = LinkerL20Output(dry_run=True).qpos_to_registers(q, names)
+    shifted = LinkerL20Output(
+        dry_run=True, finger_mcp_pitch_offset=-0.7
+    ).qpos_to_registers(q, names)
+    # root1 block, entries 1..4 are the four finger MCP pitches
+    assert all(shifted[c] > default[c] for c in range(11, 15))
+    assert shifted[:11] == default[:11]
+
+
+def test_single_joint_offset_leaves_the_others_alone(names, limits):
+    lo, hi = limits
+    q = (lo + hi) / 2
+    for f in ("index", "middle", "ring", "pinky"):
+        q[names.index(f"{f}_mcp_pitch")] = 0.5
+
+    default = LinkerL20Output(dry_run=True).qpos_to_registers(q, names)
+    one = LinkerL20Output(
+        dry_run=True, joint_offsets={"MIDDLE_MCP_PITCH": -0.7}
+    ).qpos_to_registers(q, names)
+    assert one[12] > default[12]                       # middle moved
+    assert one[:12] == default[:12]                    # index and before did not
+    assert one[13:] == default[13:]                    # ring, pinky, distal did not
+
+
+def test_large_offset_clips_travel(names, limits):
+    """Why offset magnitude is not free: it shifts the whole line.
+
+    -0.7 flattens the low end onto the register ceiling, so a third of the
+    joint's qpos range commands no motion at all.
+    """
+    lo, hi = limits
+    i = names.index("middle_mcp_pitch")
+    out = LinkerL20Output(dry_run=True, joint_offsets={"MIDDLE_MCP_PITCH": -0.7})
+    q = (lo + hi) / 2
+
+    at = {}
+    for v in (0.0, 0.57, hi[i]):
+        q[i] = v
+        at[v] = out.qpos_to_registers(q, names)[12]
+    assert at[0.0] == at[0.57] == 255, "low end should be saturated"
+    assert at[hi[i]] > 100, "high end should no longer reach full flexion"
+
+
+def test_unknown_joint_offset_rejected():
+    with pytest.raises(ValueError, match="unknown joint"):
+        LinkerL20Output(dry_run=True, joint_offsets={"NOT_A_JOINT": 0.1})

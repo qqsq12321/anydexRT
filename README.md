@@ -57,7 +57,7 @@ unrelated to the method.
 conda activate anydex          # mujoco + torch + numpy + scipy
 export PYTHONPATH=/home/qsq/qqsq12321/anydexRT
 
-pytest tests/ -q                                   # 139 unit tests
+pytest tests/ -q                                   # 143 unit tests
 python scripts/validate_chamfer_collapse.py        # rung 1 alone
 python scripts/run_ladder.py --epochs 60           # the full ladder
 ```
@@ -494,7 +494,13 @@ mapping is **not** the identity. Three measured corrections sit in between, all
 calibrated against the physical hand by GEORT rather than derived from the URDF:
 
 - **Offsets.** The four finger MCP pitches are shifted −0.152 rad (−8.7°):
-  simulation zero is not the hand's zero. The thumb CMC roll offset
+  simulation zero is not the hand's zero. Tune with
+  `--l20-finger-pitch-offset` (all four at once) or
+  `--l20-joint-offset MIDDLE_MCP_PITCH=-0.3` (one joint). Magnitude is not
+  free: an offset shifts the whole qpos→register line, so it clips travel at
+  one end. −0.152 keeps 87 % of the range usable (register 255 → 32 across the
+  joint limits); −0.7 leaves 43 % and flattens qpos 0…0.57 onto 255, i.e. the
+  finger barely curls. The thumb CMC roll offset
   (`--l20-thumb-roll-offset`) defaults to **0.075**, half the original driver's
   0.15 — that pinned qpos=0 to the alignment curve's left point, i.e. the hard
   stop. 0.075 is where the two ends stop fighting: more abduction than the
@@ -625,7 +631,7 @@ scripts/
   run_ladder.py                  the full ladder
 calibrated_pinch_poses.yaml      output of calibrate_pinch.py (L20)
 calibrated_fist_pose.yaml        output of calibrate_fist.py (L20)
-tests/           139 unit tests (losses, metrics, normalization, frames,
+tests/           143 unit tests (losses, metrics, normalization, frames,
                  smoothing, AVP, PICO protocol round-trips, L20 registers)
 ```
 

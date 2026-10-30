@@ -264,6 +264,15 @@ class LinkerL20Output:
     `dry_run=True` computes and reports registers without opening the serial
     port, which is what `teleop_avp.py --real` does unless `--confirm-real` is
     also given.
+
+    Offsets can be overridden per instance, since they are the part of the
+    mapping only a physical hand can settle: `thumb_cmc_roll_offset`,
+    `finger_mcp_pitch_offset` (applies to all four fingers at once -- the
+    default is shared), or `joint_offsets={"MIDDLE_MCP_PITCH": ...}` for a
+    single joint. Note what an offset costs: it shifts the whole qpos->register
+    line, so a large one clips range at one end. -0.7 on a finger MCP pitch,
+    for instance, flattens qpos 0..0.57 onto register 255 and leaves only 43%
+    of the travel usable, where the -0.152 default keeps 87%.
     """
 
     def __init__(
@@ -278,10 +287,20 @@ class LinkerL20Output:
         print_registers: bool = False,
         dry_run: bool = False,
         thumb_cmc_roll_offset: float = _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
+        finger_mcp_pitch_offset: float | None = None,
+        joint_offsets: dict[str, float] | None = None,
     ):
         self.dry_run = bool(dry_run)
         self._offsets = dict(_JOINT_OFFSETS_RAD)
         self._offsets["THUMB_CMC_ROLL"] = float(thumb_cmc_roll_offset)
+        if finger_mcp_pitch_offset is not None:
+            for finger in ("INDEX", "MIDDLE", "RING", "PINKY"):
+                self._offsets[f"{finger}_MCP_PITCH"] = float(finger_mcp_pitch_offset)
+        for suffix, value in (joint_offsets or {}).items():
+            key = suffix.upper()
+            if key not in _ACTIVE_JOINT_ORDER:
+                raise ValueError(f"unknown joint {suffix!r}; expected one of {_ACTIVE_JOINT_ORDER}")
+            self._offsets[key] = float(value)
         self.print_registers = bool(print_registers)
         self._open_on_exit = bool(open_on_exit)
         self._last_registers: list[int] | None = None
