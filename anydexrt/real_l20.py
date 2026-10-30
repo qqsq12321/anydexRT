@@ -12,7 +12,7 @@ physical hand by GEORT rather than derived from the URDF:
 
   1. **Offsets** (`_JOINT_OFFSETS_RAD`). The index, ring and pinky MCP pitches
      get -0.152 rad (-8.7 deg), i.e. simulation zero is not the real hand's
-     zero; MIDDLE_MCP_PITCH is currently -0.7 (under test, see the constant).
+     zero; MIDDLE_MCP_PITCH uses half that, -0.077 (see the constant).
      The thumb CMC roll offset is tunable and defaults to 0.075, half the
      original driver's 0.15 (`thumb_cmc_roll_offset`), because it decides how
      far out the thumb sits at rest and can only be judged on a physical hand.
@@ -130,18 +130,20 @@ _INVERTED_JOINTS = frozenset({
 # `teleop_avp.py --l20-thumb-roll-offset`.
 _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD = 0.075
 
-# MIDDLE_MCP_PITCH is being tried at -0.7 against a physical hand, where the
-# other three fingers keep GEORT's -0.152. Note what the magnitude costs: an
-# offset shifts the whole qpos->register line, so -0.7 saturates qpos 0..0.57
-# at register 255 (the middle finger does not move over the first half of the
-# human finger's travel) and caps flexion at 146 instead of 32, leaving 43% of
-# the range usable against -0.152's 87%. Revert to -0.15235988 to match the
-# other fingers, or override per run with
+# MIDDLE_MCP_PITCH is half the -0.152 the other three fingers use, which
+# compensates in the right direction: a less negative offset bends the finger
+# MORE (register 255 is fully extended), and the retargeter under-flexes this
+# joint -- median qpos 0.319 against the index finger's 0.644 on a PICO
+# recording, with the PIPs about equal, so the shortfall is at the MCP.
+#
+# This is a real-hand correction for a mapping asymmetry, not a fix for it;
+# -0.7 was tried first and went the wrong way, pinning 63% of frames at full
+# extension. Override per run with
 # `teleop_avp.py --l20-joint-offset MIDDLE_MCP_PITCH=<rad>`.
 _JOINT_OFFSETS_RAD = {
     "THUMB_CMC_ROLL": _DEFAULT_THUMB_CMC_ROLL_OFFSET_RAD,
     "INDEX_MCP_PITCH": -0.15235988,
-    "MIDDLE_MCP_PITCH": -0.7,
+    "MIDDLE_MCP_PITCH": -0.077,
     "RING_MCP_PITCH": -0.15235988,
     "PINKY_MCP_PITCH": -0.15235988,
 }
